@@ -1,0 +1,14 @@
+# Editor / OS cruft
+*~
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Lua / luacheck
+luacov.*.out
+.luacheckcache
+
+# Local notes not meant for the repo
+NOTES.local.md
+scratch/
