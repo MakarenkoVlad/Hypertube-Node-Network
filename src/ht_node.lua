@@ -79,6 +79,18 @@ end
 
 -- interactive first-time setup (uses the computer terminal)
 local function runSetup()
+  -- Setup must own the keyboard. Stop every tube (so nothing spins/launches) and
+  -- blank the monitor with a notice, so the live menu can't sit there eating keys.
+  for _, c in ipairs(ctrls) do pcall(c.wrap.setTargetSpeed, 0) end
+  if mon then
+    pcall(function()
+      mon.setBackgroundColor(colors.black); mon.clear()
+      mon.setTextColor(colors.yellow);    mon.setCursorPos(2, 2); mon.write("Setting up...")
+      mon.setTextColor(colors.lightGray); mon.setCursorPos(2, 4); mon.write("Type on the computer.")
+    end)
+  end
+  -- flush any queued key/char/touch events so the prompts don't auto-skip
+  os.queueEvent("ht_drain"); repeat until select(1, os.pullEvent()) == "ht_drain"
   term.clear(); term.setCursorPos(1, 1)
   print("=== HT Node setup ===")
   write("Name this node (e.g. hub, mine, nether_hub): ")
@@ -93,7 +105,7 @@ local function runSetup()
     -- terminal stays focused. Identify a tube anytime with: firmware.lua spin <n>
     print(("This node has %d tube(s). Type where each one goes."):format(#ctrls))
     print("(Unsure which is which? Quit with Ctrl+T, run: firmware.lua spin 1)")
-    sleep(0.3)   -- drain any stray keypresses so the prompts don't auto-skip
+    os.queueEvent("ht_drain"); repeat until select(1, os.pullEvent()) == "ht_drain"
     for i = 1, #ctrls do
       write(("  Tube %d goes to which node? (name, Enter = skip): "):format(i))
       local nb = read()

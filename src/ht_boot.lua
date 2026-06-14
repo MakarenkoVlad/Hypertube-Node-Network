@@ -121,7 +121,11 @@ print("HT node boot (group " .. GROUP .. ").")
 -- on-screen typing works normally; it writes /ht_node.cfg and exits.
 if fs.exists(FW) and not fs.exists("/ht_node.cfg") then
   print("First-time setup - type your answers on this screen:")
-  shell.run(FW, "setup")
+  shell.run(FW, "setup")                       -- runs ALONE here; the OTA listener
+  if fs.exists("/ht_node.cfg") then            -- below hasn't started yet, so your
+    print("Setup saved - rebooting...")        -- keystrokes can't be stolen.
+    sleep(1); os.reboot()
+  end
 end
 if openModem() then
   parallel.waitForAny(runFirmware, otaListener)
