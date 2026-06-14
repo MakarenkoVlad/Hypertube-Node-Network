@@ -23,7 +23,7 @@
 local RPM           = 128
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
 local TRIP_TIMEOUT  = 12     -- seconds before a trip's gates auto-release
-local PRESPIN       = 1.0    -- s: at a multi-hop start, let downstream junctions spin up before launch
+local RELAUNCH_HOLD = 3      -- s a junction keeps its exit spinning after catching the rider
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
 local STALE_SEC    = 30      -- forget a node whose state we haven't refreshed in this long
 local PROTO        = "hypertube"
@@ -239,10 +239,11 @@ local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComput
 
 -- forget nodes we haven't heard a fresh timestamp for (automatic dead-node removal)
 local function pruneStale()
-  local now = os.epoch("utc")
+  local now, dead = os.epoch("utc"), {}
   for n, ts in pairs(gen) do
-    if n ~= NAME and (now - ts) > STALE_SEC * 1000 then graph[n] = nil; gen[n] = nil end
+    if n ~= NAME and (now - ts) > STALE_SEC * 1000 then dead[#dead + 1] = n end
   end
+  for _, n in ipairs(dead) do graph[n] = nil; gen[n] = nil end
 end
 
 -- refresh our own row, then gossip the ENTIRE known map
@@ -318,23 +319,34 @@ local function allStop() gateToward(nil) end
 
 -- ---- shared trip state ---------------------------------------------------
 local active, tripTimer = nil, nil
+local awaiting, relaunchStop = nil, nil       -- junction catch-and-relaunch: {to=nextHop, deadline}
 local function armTimeout() tripTimer = os.startTimer(TRIP_TIMEOUT) end
 
 local function indexIn(path) for i, n in ipairs(path) do if n == NAME then return i end end end
 
 -- set this node's gate for a trip and return a human hint for our screen
 local function applyTrip(t)
+  awaiting = nil                               -- recompute fresh for the current route
   local i = indexIn(t.path)
-  if not i then allStop(); return nil end
+  if not i then allStop(); return nil end      -- we're not on this path
   if i == #t.path then allStop(); return ("Arrived: %s"):format(t.rider or "traveller") end
   local nxt = t.path[i + 1]
-  gateToward(nxt)                              -- spins nothing if nxt is a portal hop
-  if controllerToward(nxt) then
-    if i == 1 then return ("Board -> %s"):format(t.to) end
-    return ("Pass through -> %s"):format(t.to)
-  else
-    return ("Walk through the portal to %s"):format(nxt)   -- portal hop
+  if not controllerToward(nxt) then            -- portal hop: no tube/controller here
+    allStop(); return ("Walk through the portal to %s"):format(nxt)
   end
+  if i == 1 then                               -- origin: the rider is on OUR pad - launch now
+    gateToward(nxt); return ("Board -> %s"):format(t.to)
+  end
+  -- intermediate junction: CATCH then RELAUNCH so the entrance angle stops mattering.
+  -- Keep the exit shut; let the rider fly in and STOP on the pad. The pad poll fires
+  -- the exit once it detects them (a stationary rider launches in any direction).
+  if detector then
+    allStop()
+    awaiting = { to = nxt, deadline = os.epoch("utc") + TRIP_TIMEOUT * 1000 }
+    return ("Catching rider -> %s"):format(t.to)
+  end
+  gateToward(nxt)                              -- no detector here: fly-through (needs 90deg build)
+  return ("Pass through -> %s"):format(t.to)
 end
 
 -- ---- player presence -----------------------------------------------------
@@ -381,7 +393,7 @@ local function refresh()
 end
 
 -- ---- trips ---------------------------------------------------------------
-local function clearTrip() active, hint = nil, nil; allStop(); refresh() end
+local function clearTrip() active, hint, awaiting = nil, nil, nil; allStop(); refresh() end
 
 local function startTrip(dest)
   if dest == NAME then return end
@@ -394,15 +406,8 @@ local function startTrip(dest)
   local now = os.epoch("utc")
   local t = { type = "ROUTE", id = now, from = NAME, to = dest, path = path, rider = rider, ts = now }
   rednet.broadcast(t, PROTO)                 -- tell every hop on the path to open its gate FIRST
-  active = t; armTimeout()
-  if #path > 2 then
-    -- multi-hop: give the downstream junction(s) a beat to spin up to speed, so the
-    -- next entrance is already open when the rider reaches it, then launch.
-    draw(("Routing via %d stop(s)..."):format(#path - 2), colors.orange)
-    sleep(PRESPIN)
-  end
-  hint = applyTrip(t); refresh()             -- now open OUR gate and launch the rider
-end
+  active = t; hint = applyTrip(t); armTimeout(); refresh()   -- launch from our pad; junctions
+end                                                          -- catch & relaunch on their own
 
 local function handle(msg)
   if type(msg) ~= "table" then return end
@@ -450,12 +455,19 @@ while true do
         rednet.broadcast({ type = "LSREQ" }, PROTO); broadcastState()
         warmTimer = os.startTimer(0.5)
       end
+    elseif e[2] == relaunchStop then allStop()      -- close a junction exit after the rider left
     elseif e[2] == tripTimer then clearTrip()
     elseif e[2] == padTimer then
-      -- destination arrival clears the trip; otherwise just refresh the greeting
       if active and active.to == NAME and riderOnPad() then
+        -- we are the DESTINATION and the rider has landed: confirm arrival
         rednet.broadcast({ type = "ARRIVED", at = NAME, id = active.id }, PROTO)
         clearTrip()
+      elseif awaiting and riderOnPad() then
+        -- JUNCTION: the rider has landed and stopped here - NOW fire the exit toward the
+        -- next hop. Standing still, they launch whatever way the tube points (any angle).
+        gateToward(awaiting.to); relaunchStop = os.startTimer(RELAUNCH_HOLD); awaiting = nil; refresh()
+      elseif awaiting and os.epoch("utc") > awaiting.deadline then
+        awaiting = nil; allStop()                   -- rider never showed; give up and reset
       elseif not active then refresh() end
       padTimer = os.startTimer(1)
     end
