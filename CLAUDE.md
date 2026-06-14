@@ -39,6 +39,7 @@ CLAUDE.md                     this file
 README.md                     human overview + quickstart + Claude Code kickoff prompt
 src/
   hypertube_node.lua          MAIN firmware: station / junction / terminal (routing tables)
+  install.lua                 in-game installer: splice config into firmware -> startup (disk or HTTP)
   single_room_selector.lua    v1 standalone: one room, one entrance per destination (reference / hub building block)
 tools/
   build_routes.lua            BUILD STEP (off-game Lua): one network graph -> per-node EXITS/ROUTES by shortest path
@@ -62,6 +63,7 @@ test/
 - **Validate config at boot** (e.g. ROUTES must reference defined EXITS) with a clear `error()` — fail loud, in-game debugging is painful.
 - **No blocking sleeps in the event loop.** Use `os.pullEvent` + `os.startTimer`. The single `while true` event loop dispatches `monitor_touch`, `rednet_message`, `timer`, `redstone`.
 - Keep programs **single-file** and dependency-free.
+- **Config markers:** the firmware's per-node config region is delimited by `-- @HT-CONFIG-START` / `-- @HT-CONFIG-END`. `tools/build_routes.lua --startup` and `src/install.lua` replace everything between them. Keep both markers present, unindented, and around exactly STATION..DETECT (PROTO/TRIP_TIMEOUT stay below the end marker).
 
 ## How to validate (this machine)
 
@@ -79,7 +81,7 @@ If `luacheck` isn't installed: `brew install luacheck` (it bundles a compatible 
 - [ ] **Resolve Step 0** and record results in `test/mechanic-test.md`; relax safety nets only if justified.
 - [x] **Auto-generated ROUTES:** `tools/build_routes.lua` turns one network graph (`config/network.example.lua`) into per-node EXITS/ROUTES by shortest path. Runtime format unchanged; see `docs/implementation.md` §9.
 - [ ] **Concurrent trips / block-signalling** so the network isn't single-occupancy.
-- [ ] **Installer:** one-line `pastebin get` / `wget` or floppy-disk deploy that writes `startup` + drops in per-node config.
+- [x] **Installer:** `src/install.lua` deploys from a floppy or HTTP — splices a node's config into the firmware (or copies a pre-built `<node>.startup.lua`), writes `/startup`, labels the computer, reboots. Bundle built by `tools/build_routes.lua --startup`. See `docs/implementation.md` §10.
 - [ ] **Shared directory distribution:** push the `STATIONS` list to all terminals (rednet or disk) so it isn't copied by hand.
 - [ ] **Niceties:** speaker "departing" chime, lamp indicators per exit, an admin "reset network" broadcast.
 

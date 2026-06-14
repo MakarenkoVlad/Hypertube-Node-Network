@@ -135,7 +135,7 @@ On each computer: `edit startup`, paste `hypertube_node.lua`, save, reboot. Then
 - `ROUTES` — destination → exit (or `"RELEASE"`).
 - `MODEM`, `MONITOR` (nil for headless junctions), optional `DETECT`.
 
-`config/stations.example.lua` has a complete worked network including the junction. Find peripheral names with `lua` → `peripheral.getNames()`. For anything bigger than a few nodes, generate these blocks instead of hand-writing them — see §9.
+`config/stations.example.lua` has a complete worked network including the junction. Find peripheral names with `lua` → `peripheral.getNames()`. For anything bigger than a few nodes, generate these blocks instead of hand-writing them (§9) and deploy them with the installer (§10).
 
 ---
 
@@ -151,8 +151,8 @@ Hand-writing ROUTES per node is fine for a few stations but gets error-prone as 
   lua tools/build_routes.lua config/network.example.lua -     # or print the blocks to stdout
   ```
 
-  For every node it runs a shortest-path (BFS) search to each station and emits that node's next-hop EXITS + ROUTES block (plus STATIONS on any node with a monitor). It prints a routing matrix for review and warns about unreachable destinations.
-- **Deploy** the emitted block by pasting it over the CONFIG section at the top of `src/hypertube_node.lua` on that node, then reboot.
+  For every node it runs a shortest-path (BFS) search to each station and emits that node's next-hop EXITS + ROUTES block, plus the shared STATIONS directory (every node carries it so each config is self-contained). It prints a routing matrix for review and warns about unreachable destinations.
+- **Deploy** the emitted block by pasting it over the CONFIG section at the top of `src/hypertube_node.lua` on that node, or automate it with the installer (§10).
 
 The emitted EXITS/ROUTES are the **same runtime format** the firmware already consumes — nothing in `hypertube_node.lua` changes and hand-written configs keep working. A junction still falls out for free: the generator simply finds that a node with 2+ exits sends different destinations down different tubes.
 
@@ -160,7 +160,36 @@ The emitted EXITS/ROUTES are the **same runtime format** the firmware already co
 
 ---
 
-## 10. Limitations & tradeoffs
+## 10. Deploying with the installer
+
+`src/install.lua` turns the build output into a ready `/startup` on a fresh computer — no hand-editing the config block.
+
+1. **Build the bundle** off-game (config blocks plus pre-spliced startups):
+
+   ```bash
+   lua tools/build_routes.lua config/network.example.lua --startup
+   ```
+
+   Per node this writes both `config/generated/<node>.lua` (config block) and `config/generated/<node>.startup.lua` (firmware + config already spliced).
+2. **Get the files in-game**, either way:
+   - **Disk** — copy `src/hypertube_node.lua`, `src/install.lua`, and the `config/generated/` files onto a floppy; or
+   - **HTTP** — host the repo somewhere with raw URLs (GitHub raw, pastebin).
+3. **Run it on each computer**:
+
+   ```
+   install                -- pick this node from a menu (disk)
+   install <node>         -- install a named node
+   install --src /disk    -- use a specific directory as the bundle
+   install --url <base>   -- fetch firmware + config over HTTP from <base>
+   ```
+
+   The installer locates this node's config, splices it into the firmware between the `@HT-CONFIG-START` / `@HT-CONFIG-END` markers (or copies a pre-built `<node>.startup.lua` if present), writes `/startup`, sets the computer label to the node id, and offers to reboot.
+
+The markers are the only firmware change this needs: everything between them is per-node config (STATION/STATIONS/EXITS/ROUTES/MODEM/MONITOR/DETECT); PROTO and TRIP_TIMEOUT sit below the end marker and are never touched. Hand deployment still works (paste the firmware, paste a `<node>.lua` block between the markers) — the installer just automates it.
+
+---
+
+## 11. Limitations & tradeoffs
 
 - **One traveller at a time** per network (gate states are shared). Fine for a base/SMP; concurrent trips need block-signalling (future work).
 - **Static routing tables** — each node lists its next hop per destination. Clear and flexible; for larger networks, generate them from a single graph with `tools/build_routes.lua` instead of hand-writing (§9).
@@ -168,7 +197,7 @@ The emitted EXITS/ROUTES are the **same runtime format** the firmware already co
 
 ---
 
-## 11. Growth
+## 12. Growth
 
 - **More stations / branches** — add nodes and exits; extend each affected node's ROUTES. A new junction is just a node with another exit.
 - **Cross-dimension** — Ender Modems make a Nether/End station just another node.
@@ -177,7 +206,7 @@ The emitted EXITS/ROUTES are the **same runtime format** the firmware already co
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 - **Won't forward / catch:** recheck Step 0 gap + facing; confirm the forward exit is actually powered (clutch un-braked) during the trip.
 - **Junction sends you the wrong way:** check that node's `ROUTES[dest]` and that each `EXITS` name maps to the right physical tube.
@@ -186,4 +215,5 @@ The emitted EXITS/ROUTES are the **same runtime format** the firmware already co
 - **Stuck "Line busy":** no `ARRIVED` received — wire a detector or lower `TRIP_TIMEOUT`.
 - **Relay not found:** the network name doesn't match config — right-click the relay's wired modem to read it.
 - **Modem range warning:** swap the plain modem for an **Ender Modem**.
+- **Installer can't find the bundle:** insert the deploy disk, or pass `--src <dir>` / `--url <base>`. If it errors about missing `@HT-CONFIG` markers, the firmware on the bundle has had them removed — restore them around the config region.
 ```

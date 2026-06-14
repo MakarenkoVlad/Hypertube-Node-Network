@@ -16,6 +16,10 @@
   Deploy: edit startup -> paste -> Ctrl+S, Ctrl+X -> reboot.
 --]]
 
+-- @HT-CONFIG-START  -- per-node config. Generate it with tools/build_routes.lua
+--   and deploy with src/install.lua, or hand-edit it here. Keep BOTH markers
+--   intact and unindented — the generator and installer replace everything
+--   between them. PROTO/TRIP_TIMEOUT below the END marker are not per-node.
 ------------------------------------------------------------------
 -- THIS NODE
 ------------------------------------------------------------------
@@ -63,6 +67,7 @@ local ROUTES = {
 local MODEM   = "top"      -- side of the ENDER (wireless) modem
 local MONITOR = "right"    -- monitor side/name, or nil for a headless junction
 local DETECT  = nil        -- a COMPUTER side wired to an arrival plate, or nil
+-- @HT-CONFIG-END
 
 local PROTO        = "hypertube"
 local TRIP_TIMEOUT = 30     -- seconds before the line auto-clears with no arrival

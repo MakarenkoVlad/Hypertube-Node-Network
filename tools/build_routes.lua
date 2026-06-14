@@ -31,7 +31,15 @@
 
 local args = { ... }
 
-local USAGE = "usage: lua tools/build_routes.lua <network.lua> [outdir | -]"
+local USAGE = [[usage: lua tools/build_routes.lua <network.lua> [outdir | -] [options]
+  <network.lua>       network graph (a file that `return`s { stations, nodes })
+  [outdir]            where to write <node>.lua config blocks (default: config/generated)
+  -                   print config blocks to stdout instead of writing files
+options:
+  --startup           also emit ready-to-run <node>.startup.lua (firmware + config spliced)
+  --firmware <path>   firmware template for --startup (default: src/hypertube_node.lua)]]
+
+local START_MARK, END_MARK = "@HT-CONFIG-START", "@HT-CONFIG-END"
 
 -- ---- tiny helpers --------------------------------------------------------
 local function die(fmt, ...)
@@ -246,10 +254,12 @@ end
 local function emitNode(net, nodeId, routeMap)
   local node = net.nodes[nodeId]
   local block = { "local STATION = " .. q(nodeId), "" }
-  if node.monitor ~= nil then                  -- a terminal needs the destination directory
-    block[#block + 1] = emitStations(net.stations)
-    block[#block + 1] = ""
-  end
+  -- STATIONS is emitted for EVERY node: the firmware references it unconditionally
+  -- (nameById), and a generated block replaces the whole config region, so it must
+  -- be self-contained. Terminals show it on screen; a headless junction just carries
+  -- the directory harmlessly.
+  block[#block + 1] = emitStations(net.stations)
+  block[#block + 1] = ""
   block[#block + 1] = emitExits(node.exits)
   block[#block + 1] = ""
   block[#block + 1] = emitRoutes(routeMap)
@@ -263,14 +273,46 @@ end
 local function fileHeader(nodeId, srcPath)
   return table.concat({
     "-- ===========================================================================",
-    "-- AUTO-GENERATED — node '" .. nodeId .. "'",
-    "-- Source graph: " .. srcPath,
-    "-- Generator:    tools/build_routes.lua",
-    "-- Paste this block over the CONFIG section at the top of src/hypertube_node.lua",
-    "-- on this node's computer. Do not hand-edit — change the graph and regenerate.",
+    "-- AUTO-GENERATED — config for node '" .. nodeId .. "'",
+    "-- Source graph: " .. srcPath .. "   (regenerate with tools/build_routes.lua)",
+    "-- Don't hand-edit — change the graph, rebuild, and redeploy (src/install.lua).",
     "-- ===========================================================================",
     "",
   }, "\n")
+end
+
+-- ---- firmware splicing (for --startup) -----------------------------------
+local function splitLines(s)
+  local lines = {}
+  for line in (s .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = line end
+  return lines
+end
+
+local function readFile(path)
+  local f, err = io.open(path, "r")
+  if not f then die("cannot read %s: %s", path, tostring(err)) end
+  local data = f:read("*a"); f:close()
+  return data
+end
+
+-- replace everything between the firmware's @HT-CONFIG markers with `block`,
+-- keeping the marker lines themselves. Identical algorithm to src/install.lua.
+local function splice(firmware, block, label)
+  local lines = splitLines(firmware)
+  local s, e
+  for i, line in ipairs(lines) do
+    if not s and line:find(START_MARK, 1, true) then s = i end
+    if not e and line:find(END_MARK, 1, true) then e = i end
+  end
+  if not s or not e or s >= e then
+    die("%s has no usable %s / %s markers (need start before end)",
+      label or "firmware", START_MARK, END_MARK)
+  end
+  local out = {}
+  for i = 1, s do out[#out + 1] = lines[i] end             -- up to & incl. START marker
+  for _, bl in ipairs(splitLines(block)) do out[#out + 1] = bl end
+  for i = e, #lines do out[#out + 1] = lines[i] end         -- END marker onward
+  return table.concat(out, "\n")
 end
 
 -- ---- routing matrix (human review) ---------------------------------------
@@ -301,10 +343,27 @@ local function printMatrix(net, routes, stationIds, out)
 end
 
 -- ---- main ----------------------------------------------------------------
-local netPath = args[1]
+-- positional: <network.lua> [outdir|-];  flags: --startup, --firmware <path>
+local netPath, outdir, wantStartup, firmwarePath
+do
+  local positionals, i = {}, 1
+  while i <= #args do
+    local a = args[i]
+    if a == "-h" or a == "--help" then print(USAGE); os.exit(0)
+    elseif a == "--startup" then wantStartup = true
+    elseif a == "--firmware" then i = i + 1; firmwarePath = args[i]
+    elseif a:sub(1, 2) == "--" then die("unknown option '%s'\n%s", a, USAGE)
+    else positionals[#positionals + 1] = a end
+    i = i + 1
+  end
+  netPath = positionals[1]
+  outdir = positionals[2] or "config/generated"
+end
 if netPath == nil then io.stderr:write(USAGE .. "\n"); os.exit(1) end
-if netPath == "-h" or netPath == "--help" then print(USAGE); os.exit(0) end
-local outdir = args[2] or "config/generated"
+firmwarePath = firmwarePath or "src/hypertube_node.lua"
+if wantStartup and outdir == "-" then
+  die("--startup writes files; pass a real outdir, not '-'")
+end
 
 local net = loadNetwork(netPath)
 validate(net, netPath)
@@ -315,7 +374,9 @@ for _, u in ipairs(unreachable) do
   warn("node '%s' has no route to station '%s' — the graph isn't connected that way", u.node, u.dest)
 end
 
+local firmware = wantStartup and readFile(firmwarePath) or nil
 local nodeIds = sortedKeys(net.nodes)
+
 if outdir == "-" then
   for _, n in ipairs(nodeIds) do
     io.write("\n-- ##################### node: " .. n .. " #####################\n\n")
@@ -324,13 +385,20 @@ if outdir == "-" then
   printMatrix(net, routes, stationIds, io.stderr)   -- keep stdout pure config
 else
   os.execute('mkdir -p "' .. outdir .. '"')         -- off-game dev tool: POSIX mkdir is fine
-  for _, n in ipairs(nodeIds) do
-    local path = outdir .. "/" .. n .. ".lua"
+  local function write(path, content)
     local f, err = io.open(path, "w")
     if not f then die("cannot write %s: %s", path, tostring(err)) end
-    f:write(fileHeader(n, netPath) .. emitNode(net, n, routes[n]))
-    f:close()
+    f:write(content); f:close()
   end
-  io.write(string.format("Wrote %d node config(s) to %s/\n", #nodeIds, outdir))
+  for _, n in ipairs(nodeIds) do
+    local block = fileHeader(n, netPath) .. emitNode(net, n, routes[n])
+    write(outdir .. "/" .. n .. ".lua", block)
+    if wantStartup then
+      -- splice the SAME block install.lua reads from <node>.lua, so both agree
+      write(outdir .. "/" .. n .. ".startup.lua", splice(firmware, block, firmwarePath))
+    end
+  end
+  io.write(string.format("Wrote %d node config(s)%s to %s/\n",
+    #nodeIds, wantStartup and " + startup files" or "", outdir))
   printMatrix(net, routes, stationIds, io.stdout)
 end
