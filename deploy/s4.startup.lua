@@ -17,75 +17,46 @@
 --]]
 
 -- @HT-CONFIG-START  -- per-node config. Generate it with tools/build_routes.lua
---   and deploy with src/install.lua, or hand-edit it here. Keep BOTH markers
---   intact and unindented — the generator and installer replace everything
---   between them. PROTO/TRIP_TIMEOUT below the END marker are not per-node.
-------------------------------------------------------------------
--- THIS NODE
-------------------------------------------------------------------
-local STATION = "main_base"   -- this node's unique id
+-- ===========================================================================
+-- AUTO-GENERATED — config for node 's4'
+-- Source graph: config/hub_4spoke.lua   (regenerate with tools/build_routes.lua)
+-- Don't hand-edit — change the graph, rebuild, and redeploy (src/install.lua).
+-- ===========================================================================
+local STATION = "s4"
 
-------------------------------------------------------------------
--- DIRECTORY — destinations shown on the touchscreen (terminals only).
--- Keep identical on every station that has a monitor. id must be unique.
-------------------------------------------------------------------
 local STATIONS = {
-  { id = "main_base", name = "Main Base"  },
-  { id = "mine",      name = "Mineshaft"  },
-  { id = "farm",      name = "Farm"       },
-  { id = "nether",    name = "Nether Hub" },
+  { id = "hub", name = "Hub"    },
+  { id = "s1",  name = "Stop 1" },
+  { id = "s2",  name = "Stop 2" },
+  { id = "s3",  name = "Stop 3" },
+  { id = "s4",  name = "Stop 4" },
 }
 
-------------------------------------------------------------------
--- EXITS — the powered entrances this node can send a traveller out through.
--- Name them after the physical tube ("toMine", "north", "up"...). Each exit
--- drives ONE gate, in EITHER of two styles:
---   Create Rotational Speed Controller (computer attached to the RSC):
---     { controller = "<peripheral name or side>", rpm = 32 }
---       on  -> setTargetSpeed(rpm)   off -> setTargetSpeed(0)
---   Redstone Relay + Create Clutch:
---     { relay = "redstone_relay_0", side = "back", invert = true }
---       invert=true -> redstone ON brakes the entrance (Clutch)
-------------------------------------------------------------------
 local EXITS = {
-  toMine = { controller = "Create_RotationSpeedController_0", rpm = 32 },
+  to_hub = { controller = "Create_RotationSpeedController_0", rpm = 32 },
 }
 
-------------------------------------------------------------------
--- ROUTES — for each destination id, the EXIT that forwards toward it.
--- Use "RELEASE" for destinations reached BY dropping out here (this node).
--- A JUNCTION switches among tubes simply by pointing different destinations
--- at different exits, e.g.  farm = "toFarm",  nether = "toNether".
-------------------------------------------------------------------
 local ROUTES = {
-  main_base = "RELEASE",   -- I am main_base
-  mine      = "toMine",
-  farm      = "toMine",
-  nether    = "toMine",
+  hub = "to_hub",
+  s1  = "to_hub",
+  s2  = "to_hub",
+  s3  = "to_hub",
+  s4  = "RELEASE",   -- arrive here
 }
 
-------------------------------------------------------------------
--- PATHS — optional, filled by the builder: for each destination, the ordered
--- node ids from HERE to it. Lets a node tell whether it is ON the current
--- trip's route, so a junction never powers an entrance for a trip going
--- somewhere else. Empty = unconfined (every node powers its next hop).
-------------------------------------------------------------------
-local PATHS = {}
+local PATHS = {
+  hub = { "s4", "hub" },
+  s1  = { "s4", "hub", "s1" },
+  s2  = { "s4", "hub", "s2" },
+  s3  = { "s4", "hub", "s3" },
+}
 
-------------------------------------------------------------------
--- PERIPHERALS
-------------------------------------------------------------------
-local MODEM   = "top"      -- side of the ENDER (wireless) modem
-local MONITOR = "right"    -- monitor side/name, or nil for a headless junction
-local DETECT  = nil        -- a COMPUTER side wired to an arrival plate, or nil
-
--- Player detection at the boarding pad — Advanced Peripherals Player Detector.
--- PAD_DETECTOR = its peripheral name/side, or nil to disable detection. When
--- set, the node greets whoever is on the pad and only launches while a player
--- is standing there. BOARD_RANGE = blocks around the detector that count as
--- "on the pad" (keep it small; the detector is the centre, not the computer).
-local PAD_DETECTOR = nil   -- e.g. "player_detector_0"; nil = off
+local MODEM   = "top"
+local MONITOR = "right"
+local DETECT  = nil
+local PAD_DETECTOR = "player_detector_0"
 local BOARD_RANGE  = 2
+
 -- @HT-CONFIG-END
 
 local PROTO        = "hypertube"

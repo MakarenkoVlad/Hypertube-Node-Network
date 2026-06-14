@@ -87,18 +87,21 @@ Also note which **lock mode** (wrench) still lets an in-flight traveller be caug
 
 **Shared:** CC: Tweaked **1.114+** (Redstone Relay block; runs natively on NeoForge 1.21.1), one Create rotation source with enough SU, and the hypertube tubes themselves.
 
-**Per node:** Advanced Computer; **Ender Modem** (unlimited / cross-dimension range); one Hypertube Entrance + Create Clutch + Redstone Relay (+ Wired Modem) **per exit**; Networking Cable; Advanced Monitor (≥3×2) if it's a boarding station; optional arrival plate/attachment and indicator lamps.
+**Per node:** Advanced Computer; **Ender Modem** (unlimited / cross-dimension range); one Hypertube Entrance + Create Clutch + Redstone Relay (+ Wired Modem) **per exit**; Networking Cable; Advanced Monitor (≥3×2) if it's a boarding station; a **Player Detector** (Advanced Peripherals) at the boarding pad for "who is standing here" detection; optional arrival plate/attachment and indicator lamps.
 
 ---
 
 ## 6. Build per node
 
 1. **Entrances** — one departure entrance per exit, each aimed down its tube, with a boarding/arrival pad they can reach. Set the gap from Step 0.
-2. **Power + gating** — rotation from the shared source through a **Create Clutch** into each entrance (`redstone ON = braked = off`). If the entrance is redstone-lockable, wire that instead and set `invert = false`.
-3. **Relays** — a **Redstone Relay** per exit, output wired to its clutch (and optional lamp). Put a **Wired Modem** on each relay; connect by **Networking Cable** to a wired modem on the computer. Right-click each modem and note the printed name (e.g. `redstone_relay_1`).
+2. **Power + gating** — two options per entrance. **(a) Rotational Speed Controller** (recommended if the computer drives it): feed the entrance's rotation through an RSC and let the computer set its target speed — an RPM to run, `0` to stop. Config: `{ controller = "<RSC name/side>", rpm = 32 }`. **(b) Create Clutch + Redstone Relay**: rotation through a clutch (`redstone ON = braked = off`); config `{ relay, side, invert = true }`.
+3. **Wire the gate to the computer** — for an **RSC**, place it against the computer (wrap by side) or on a **Wired Modem** + **Networking Cable** (network name like `Create_RotationSpeedController_0`). For a **relay**, put a Wired Modem on each Redstone Relay and cable it to the computer. Confirm names in-game with `peripheral.getNames()`.
 4. **Computer + modem** — Advanced Computer with the **Ender Modem** on a free face; Advanced Monitor against it for stations.
 5. **Lock mode** — wrench entrances to the mode chosen in Step 0.
-6. **Optional detector** — arrival plate/attachment into a **side of the computer** so it pulses when someone exits here.
+6. **Optional arrival detector** — arrival plate/attachment into a **side of the computer** so it pulses when someone exits here.
+7. **Boarding pad + Player Detector** — one block the rider stands on, with this node's 2–3 departure entrances **facing that block** from different sides. Place a **Player Detector** (Advanced Peripherals) at the pad, connected to the computer (wired modem, or adjacent). The node opens only the entrance toward the chosen destination, so the rider on the pad is pulled into the right tube.
+
+**Player detection.** With a Player Detector set (`PAD_DETECTOR`), the node reads who's on the pad via `getPlayersInRange(BOARD_RANGE)`: it greets them by name and only launches while a player is actually standing there. The rider's name rides along and shows on the destination's screen ("Arriving: …"). Leave `PAD_DETECTOR = nil` to disable this (a bare pressure plate can still confirm presence, but not identity). The computer also labels itself with its node id on boot, so each machine is named in-game.
 
 ---
 
@@ -106,21 +109,25 @@ Also note which **lock mode** (wrench) still lets an in-flight traveller be caug
 
 `src/hypertube_node.lua` runs on every computer and is both the routing node and (if it has a monitor) the boarding terminal.
 
-Wireless protocol (rednet, `"hypertube"`):
+Wireless protocol (rednet, `"hypertube"`). Every message is a table with a `type`:
 
-- `ROUTE{ dest, trip }` — broadcast when a destination is tapped. Every node sets its gates from `ROUTES[dest]`.
-- `ARRIVED{ at, trip }` — broadcast by the destination node when its detector fires; every node clears the line (gates off, ready for the next trip).
+- `ROUTE{ trip }` — broadcast when a destination is tapped. `trip = { id, from, to, rider, ts, path }`. Each node records it as the shared `active` trip and powers its exit toward `to` **only if it is on `path`** — so a junction never grabs a passer-by for a trip routed elsewhere. `rider` is the boarder's name from the Player Detector.
+- `ARRIVED{ tripId, at }` — the destination node broadcasts this when its arrival detector fires; every node clears `active` and releases its gates.
+- `SYNC_REQ{}` / `SYNC_RES{ active, recent }` — on boot a node asks the others for the current state and adopts it, so a freshly placed or rebooted computer catches up on a trip already in progress.
 
-Without detectors, each node clears after `TRIP_TIMEOUT` (default 30 s). Because gate states are network-wide, **one trip travels at a time**: while a trip is live, terminals show "Line busy" and refuse a new launch until `ARRIVED` or timeout.
+**Shared travel state.** Every node holds the *same* view: `active` (the current trip, or nil) and `recent` (a short log of finished trips). It's replicated by the messages above and resynced on boot, so all terminals show the same live status (e.g. "Net: Alice  Home→Farm"). Player detection stays local — only the optional `rider` name goes on the wire; the node polls `getPlayersInRange` to greet whoever's on the pad and listens for `playerClick` to refresh instantly.
 
-Trip flow:
+Still **one trip at a time** network-wide (single-occupancy): while `active` is set, terminals show busy and refuse a new launch until `ARRIVED` or `TRIP_TIMEOUT` (default 30 s).
+
+Trip flow (A→C through junction B):
 
 ```
-Tap "Nether Hub" at Mine
-  -> ROUTE{dest=nether} broadcast
-  -> mine powers toJct; JCT powers toNether (switch!); nether powers nothing
-  -> you board mine's toJct exit, fly through JCT onto the Nether tube, drop out at Nether
-  -> Nether detector -> ARRIVED -> whole line resets
+Tap "Station C" at A
+  -> ROUTE{ trip = { from=a, to=c, path={a,b,c}, rider="Alice", ... } } broadcast
+  -> a powers toB;  b is on path -> powers toC (switch!);  c releases (arrive);
+     d is OFF-path -> stays released, grabs nobody
+  -> you board a's exit, fly through B onto the C tube, drop out at C
+  -> C detector -> ARRIVED{tripId} -> every node clears
 ```
 
 ---
@@ -131,9 +138,10 @@ On each computer: `edit startup`, paste `hypertube_node.lua`, save, reboot. Then
 
 - `STATION` — this node's id.
 - `STATIONS` — destination directory for the menu (stations only; identical on every terminal).
-- `EXITS` — one entry per departure entrance, with its relay name/side and `invert`.
+- `EXITS` — one entry per departure entrance: a speed controller `{ controller, rpm }` (Create RSC) **or** a relay `{ relay, side, invert }`.
 - `ROUTES` — destination → exit (or `"RELEASE"`).
-- `MODEM`, `MONITOR` (nil for headless junctions), optional `DETECT`.
+- `MODEM`, `MONITOR` (nil for headless junctions), optional `DETECT` (arrival plate).
+- `PAD_DETECTOR` — Advanced Peripherals Player Detector at the pad (name/side), or `nil` to disable player detection; `BOARD_RANGE` — blocks around it counted as "on the pad" (default 2).
 
 `config/stations.example.lua` has a complete worked network including the junction. Find peripheral names with `lua` → `peripheral.getNames()`. For anything bigger than a few nodes, generate these blocks instead of hand-writing them (§9) and deploy them with the installer (§10).
 
@@ -191,8 +199,8 @@ The markers are the only firmware change this needs: everything between them is 
 
 ## 11. Limitations & tradeoffs
 
-- **One traveller at a time** per network (gate states are shared). Fine for a base/SMP; concurrent trips need block-signalling (future work).
-- **Static routing tables** — each node lists its next hop per destination. Clear and flexible; for larger networks, generate them from a single graph with `tools/build_routes.lua` instead of hand-writing (§9).
+- **One traveller at a time** per network — the shared `active` state is replicated to every node, and a node only powers gates when it's on the active trip's path, so off-path stations stay idle. Concurrent trips would need block-signalling (future work).
+- **Adding a station is two edits** — one `nodes` entry (for its monitor/detector) plus one `links` connection per tube. The builder fills routes, paths, and the reciprocal exit at both ends, and warns on one-way or unreachable tubes (§9).
 - **Step 0 is load-bearing** — everything assumes hand-off, release, and switch/redirect behave as tested.
 
 ---

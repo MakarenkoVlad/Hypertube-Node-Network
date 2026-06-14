@@ -21,6 +21,23 @@
 
   This file is plain data: it `return`s a table. It is not deployed to a
   computer — it only feeds the off-game build step.
+
+  CONNECTIONS, TWO WAYS:
+    * Per-node `exits` (used below): each node lists the entrances it powers,
+      with `to = <neighbour>`. You wire BOTH ends yourself.
+    * A top-level `links` list: declare a tube ONCE and the builder creates the
+      reciprocal exit at both ends, so a connection is never half-wired:
+
+        links = {
+          { a = "main_base", b = "mine",
+            a_relay = "redstone_relay_0", a_side = "back",   -- main_base's entrance -> mine
+            b_relay = "redstone_relay_0", b_side = "back",   -- mine's entrance -> main_base
+            invert = true },                                  -- both are clutches (default)
+        }
+
+  ADD A STATION: add one `nodes` entry (for its monitor/detector) plus one
+  `links` connection per tube, then rebuild. The builder fills routes, paths and
+  reciprocal exits, and warns on one-way or unreachable tubes.
 --]]
 
 return {
@@ -43,18 +60,21 @@ return {
   --   side   = relay output wired to the gate                      │ verbatim
   --   invert = true -> redstone ON brakes the entrance (Clutch)    ┘ into EXITS
   -- Optional per node: monitor (side/name; omit for a headless junction),
-  --   modem (default "top"), detect (arrival-plate computer side; default nil).
+  --   modem (default "top"), detect (arrival-plate computer side; default nil),
+  --   pad_detector (Advanced Peripherals Player Detector name/side at the
+  --     boarding pad; default nil = no player detection),
+  --   board_range (blocks around that detector counted as "on the pad"; default 2).
   nodes = {
 
     main_base = {
-      monitor = "right",
+      monitor = "right", pad_detector = "player_detector_0",
       exits = {
         toMine = { to = "mine", relay = "redstone_relay_0", side = "back", invert = true },
       },
     },
 
     mine = {
-      monitor = "right",
+      monitor = "right", pad_detector = "player_detector_0",
       exits = {
         toMain = { to = "main_base", relay = "redstone_relay_0", side = "back", invert = true },
         toJct  = { to = "jct",       relay = "redstone_relay_1", side = "back", invert = true },
@@ -71,14 +91,14 @@ return {
     },
 
     farm = {
-      monitor = "right",
+      monitor = "right", pad_detector = "player_detector_0",
       exits = {
         toJct = { to = "jct", relay = "redstone_relay_0", side = "back", invert = true },
       },
     },
 
     nether = {
-      monitor = "right",
+      monitor = "right", pad_detector = "player_detector_0",
       exits = {
         toJct = { to = "jct", relay = "redstone_relay_0", side = "back", invert = true },
       },

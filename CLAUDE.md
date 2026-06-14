@@ -26,9 +26,10 @@ The physical mechanic has **not been confirmed in-game yet** (see `test/mechanic
 - **Routing = exits + tables.** Each node config has `EXITS` (named entrances it can power) and `ROUTES` (destination id → exit name, or `"RELEASE"` if the destination is this node). The whole routing brain is: `for dest, power EXITS[ROUTES[dest]]; RELEASE/nil powers nothing`.
 - **A junction is just a node with ≥2 exits** whose ROUTES point different destinations at different exits. There is no separate junction program.
 - **Wireless coordination via rednet** (protocol string `"hypertube"`), Ender modems for unlimited/cross-dimension range. Messages are plain tables with a `type` field:
-  - `ROUTE{ dest, trip }` — set the network for a trip.
-  - `ARRIVED{ at, trip }` — clear the network after delivery.
-- **Single-occupancy** by design: gate states are network-wide, so one trip at a time; terminals show "Line busy" until `ARRIVED` or `TRIP_TIMEOUT`.
+  - `ROUTE{ trip }` — start a trip. `trip = { id, from, to, rider, ts, path }`; a node powers its exit toward `to` only if it is on `path` (off-path nodes stay released).
+  - `ARRIVED{ tripId, at }` — end the trip; every node clears.
+  - `SYNC_REQ{}` / `SYNC_RES{ active, recent }` — boot-time state catch-up.
+- **Shared, replicated travel state:** every node holds the same `active` trip + `recent` log; all terminals render the same live status. **Single-occupancy** — one trip at a time until `ARRIVED` or `TRIP_TIMEOUT`.
 
 The authoritative explanation is `docs/implementation.md` — keep it in sync with the code.
 
@@ -58,7 +59,7 @@ test/
 ## Conventions
 
 - **Config block at the very top** of each program (`STATION`, `STATIONS`, `EXITS`, `ROUTES`, peripherals). Everything below is logic. Users edit only the config.
-- **Gate abstraction:** `setGate(g, enable)` where `g.invert` flips for Create-Clutch (`redstone ON = brake`) vs redstone-lockable entrances. Never write raw `setOutput` in logic — go through `setGate`.
+- **Gate abstraction:** `setGate(g, enable)` drives a gate that is EITHER a Create Rotational Speed Controller `{ controller, rpm }` (on → `setTargetSpeed(rpm)`, off → `setTargetSpeed(0)`) OR a redstone relay `{ relay, side, invert }`. Never wrap peripherals or set speeds/outputs in logic — go through `setGate`.
 - **rednet messages** are tables with a `type`; always filter incoming by `protocol == PROTO`.
 - **Validate config at boot** (e.g. ROUTES must reference defined EXITS) with a clear `error()` — fail loud, in-game debugging is painful.
 - **No blocking sleeps in the event loop.** Use `os.pullEvent` + `os.startTimer`. The single `while true` event loop dispatches `monitor_touch`, `rednet_message`, `timer`, `redstone`.
@@ -80,7 +81,9 @@ If `luacheck` isn't installed: `brew install luacheck` (it bundles a compatible 
 
 - [ ] **Resolve Step 0** and record results in `test/mechanic-test.md`; relax safety nets only if justified.
 - [x] **Auto-generated ROUTES:** `tools/build_routes.lua` turns one network graph (`config/network.example.lua`) into per-node EXITS/ROUTES by shortest path. Runtime format unchanged; see `docs/implementation.md` §9.
-- [ ] **Concurrent trips / block-signalling** so the network isn't single-occupancy.
+- [x] **Shared travel state:** every node replicates `active` + `recent` over rednet (ROUTE/ARRIVED/SYNC) and renders the same live status; off-path nodes stay idle via each trip's `path`. See `docs/implementation.md` §7.
+- [x] **Connections-first graph:** `links` declares a tube once (reciprocal exits at both ends); the builder validates two-way + reachability and emits `PATHS`. Adding a station = one node + one link per tube.
+- [ ] **Concurrent trips / block-signalling** so the network isn't single-occupancy (would build on the shared state + path confinement).
 - [x] **Installer:** `src/install.lua` deploys from a floppy or HTTP — splices a node's config into the firmware (or copies a pre-built `<node>.startup.lua`), writes `/startup`, labels the computer, reboots. Bundle built by `tools/build_routes.lua --startup`. See `docs/implementation.md` §10.
 - [ ] **Shared directory distribution:** push the `STATIONS` list to all terminals (rednet or disk) so it isn't copied by hand.
 - [ ] **Niceties:** speaker "departing" chime, lamp indicators per exit, an admin "reset network" broadcast.

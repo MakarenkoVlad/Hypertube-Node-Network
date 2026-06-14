@@ -115,12 +115,75 @@ local function validate(net, path)
       if e.to == id then
         warn("node '%s' exit '%s' loops back to itself — it will never be a shortest hop", id, ename)
       end
-      if e.relay == nil or e.side == nil then
-        warn("node '%s' exit '%s' has no relay/side — generated EXITS gate wiring will be nil", id, ename)
+      if e.controller == nil and (e.relay == nil or e.side == nil) then
+        warn("node '%s' exit '%s' has no gate — set `controller` (RSC) or `relay`+`side`", id, ename)
       end
     end
     if n == 0 then
       warn("node '%s' has no exits — it can release arrivals but cannot forward anyone", id)
+    end
+  end
+end
+
+-- ---- links: declare a connection ONCE, get both directions ---------------
+-- A `links` entry becomes an exit at A toward B AND an exit at B toward A, so a
+-- tube is never half-wired. Each end's gate is either a Create speed controller
+-- ({a,b}_controller + optional {a,b}_rpm) or a redstone relay ({a,b}_relay,
+-- {a,b}_side, invert). Adding a station = its node + one link per tube.
+local function expandLinks(net)
+  if net.links == nil then return end
+  if type(net.links) ~= "table" then die("`links` must be a list of { a=, b=, ... }") end
+  net.nodes = net.nodes or {}
+  for i, lk in ipairs(net.links) do
+    if type(lk.a) ~= "string" or type(lk.b) ~= "string" then
+      die("links[%d] needs string `a` and `b` node ids", i)
+    end
+    local a, b = lk.a, lk.b
+    net.nodes[a] = net.nodes[a] or {}; net.nodes[a].exits = net.nodes[a].exits or {}
+    net.nodes[b] = net.nodes[b] or {}; net.nodes[b].exits = net.nodes[b].exits or {}
+    local function inv(over) if over ~= nil then return over end
+      if lk.invert ~= nil then return lk.invert end return true end
+    -- one end's gate: controller-style (Create RSC) if a controller is given, else relay
+    local function gate(to, ctrl, rpm, rel, side, ovr)
+      if ctrl then return { to = to, controller = ctrl, rpm = rpm or lk.rpm or 32 } end
+      return { to = to, relay = rel, side = side, invert = inv(ovr) }
+    end
+    local an, bn = "to_" .. b, "to_" .. a
+    if not net.nodes[a].exits[an] then
+      net.nodes[a].exits[an] = gate(b, lk.a_controller, lk.a_rpm, lk.a_relay, lk.a_side, lk.a_invert)
+    end
+    if not net.nodes[b].exits[bn] then
+      net.nodes[b].exits[bn] = gate(a, lk.b_controller, lk.b_rpm, lk.b_relay, lk.b_side, lk.b_invert)
+    end
+  end
+end
+
+-- ---- audit: catch half-wired or disconnected networks --------------------
+local function audit(net, fwd)
+  local has = {}
+  for a, edges in pairs(fwd) do
+    for _, e in ipairs(edges) do has[a .. ">" .. e.to] = true end
+  end
+  for a, edges in pairs(fwd) do
+    for _, e in ipairs(edges) do
+      if not has[e.to .. ">" .. a] then
+        warn("one-way tube: '%s' -> '%s' has no return exit (a real tube is two-way)", a, e.to)
+      end
+    end
+  end
+  if net.stations[1] then
+    local start = net.stations[1].id
+    local seen, queue, head = { [start] = true }, { start }, 1
+    while head <= #queue do
+      local cur = queue[head]; head = head + 1
+      for _, e in ipairs(fwd[cur] or {}) do
+        if not seen[e.to] then seen[e.to] = true; queue[#queue + 1] = e.to end
+      end
+    end
+    for _, s in ipairs(net.stations) do
+      if not seen[s.id] then
+        warn("station '%s' is not reachable from '%s' — check the connections", s.id, start)
+      end
     end
   end
 end
@@ -183,9 +246,9 @@ local function computeRoutes(net, fwd)
   local distTo = {}
   for _, d in ipairs(stationIds) do distTo[d] = distancesTo(d, fwd) end
 
-  local routes, unreachable = {}, {}
+  local routes, paths, unreachable = {}, {}, {}
   for _, nodeId in ipairs(sortedKeys(net.nodes)) do
-    local r = {}
+    local r, p = {}, {}
     for _, dest in ipairs(stationIds) do
       if dest == nodeId then
         r[dest] = "RELEASE"                 -- a station releases travellers bound for itself
@@ -193,14 +256,26 @@ local function computeRoutes(net, fwd)
         local hop = nextHop(nodeId, distTo[dest], fwd)
         if hop then
           r[dest] = hop
+          -- walk the shortest path nodeId..dest (for off-path gate confinement)
+          local route, cur, guard = { nodeId }, nodeId, 0
+          while cur ~= dest and guard < 1024 do
+            guard = guard + 1
+            local h = nextHop(cur, distTo[dest], fwd)
+            if not h then break end
+            local nb = net.nodes[cur].exits[h].to
+            route[#route + 1] = nb
+            cur = nb
+          end
+          if cur == dest then p[dest] = route end
         else
           unreachable[#unreachable + 1] = { node = nodeId, dest = dest }
         end
       end
     end
     routes[nodeId] = r
+    paths[nodeId] = p
   end
-  return routes, stationIds, unreachable
+  return routes, stationIds, unreachable, paths
 end
 
 -- ---- emit the per-node config block --------------------------------------
@@ -227,10 +302,15 @@ local function emitExits(exits)
   local out = { "local EXITS = {" }
   for _, name in ipairs(names) do
     local e = exits[name]
-    local fields = string.format("relay = %s, side = %s, invert = %s",
-      e.relay ~= nil and q(e.relay) or "nil",
-      e.side ~= nil and q(e.side) or "nil",
-      tostring(e.invert and true or false))
+    local fields
+    if e.controller ~= nil then
+      fields = string.format("controller = %s, rpm = %s", q(e.controller), tostring(e.rpm or 32))
+    else
+      fields = string.format("relay = %s, side = %s, invert = %s",
+        e.relay ~= nil and q(e.relay) or "nil",
+        e.side ~= nil and q(e.side) or "nil",
+        tostring(e.invert and true or false))
+    end
     out[#out + 1] = string.format("  %-" .. kw .. "s = { %s },", rk[name], fields)
   end
   out[#out + 1] = "}"
@@ -251,7 +331,22 @@ local function emitRoutes(routeMap)
   return table.concat(out, "\n")
 end
 
-local function emitNode(net, nodeId, routeMap)
+local function emitPaths(pathMap)
+  local dests = sortedKeys(pathMap)
+  if #dests == 0 then return "local PATHS = {}" end
+  local rk, kw = {}, 0
+  for _, d in ipairs(dests) do rk[d] = key(d); kw = math.max(kw, #rk[d]) end
+  local out = { "local PATHS = {" }
+  for _, d in ipairs(dests) do
+    local ids = {}
+    for _, nid in ipairs(pathMap[d]) do ids[#ids + 1] = q(nid) end
+    out[#out + 1] = string.format("  %-" .. kw .. "s = { %s },", rk[d], table.concat(ids, ", "))
+  end
+  out[#out + 1] = "}"
+  return table.concat(out, "\n")
+end
+
+local function emitNode(net, nodeId, routeMap, pathMap)
   local node = net.nodes[nodeId]
   local block = { "local STATION = " .. q(nodeId), "" }
   -- STATIONS is emitted for EVERY node: the firmware references it unconditionally
@@ -264,9 +359,13 @@ local function emitNode(net, nodeId, routeMap)
   block[#block + 1] = ""
   block[#block + 1] = emitRoutes(routeMap)
   block[#block + 1] = ""
+  block[#block + 1] = emitPaths(pathMap or {})
+  block[#block + 1] = ""
   block[#block + 1] = "local MODEM   = " .. q(node.modem or "top")
   block[#block + 1] = "local MONITOR = " .. (node.monitor ~= nil and q(node.monitor) or "nil")
   block[#block + 1] = "local DETECT  = " .. (node.detect ~= nil and q(node.detect) or "nil")
+  block[#block + 1] = "local PAD_DETECTOR = " .. (node.pad_detector ~= nil and q(node.pad_detector) or "nil")
+  block[#block + 1] = "local BOARD_RANGE  = " .. tostring(node.board_range or 2)
   return table.concat(block, "\n") .. "\n"
 end
 
@@ -366,9 +465,11 @@ if wantStartup and outdir == "-" then
 end
 
 local net = loadNetwork(netPath)
+expandLinks(net)                       -- turn `links` into reciprocal exits first
 validate(net, netPath)
 local fwd = forwardEdges(net)
-local routes, stationIds, unreachable = computeRoutes(net, fwd)
+audit(net, fwd)                        -- warn on one-way tubes / unreachable stations
+local routes, stationIds, unreachable, paths = computeRoutes(net, fwd)
 
 for _, u in ipairs(unreachable) do
   warn("node '%s' has no route to station '%s' — the graph isn't connected that way", u.node, u.dest)
@@ -380,7 +481,7 @@ local nodeIds = sortedKeys(net.nodes)
 if outdir == "-" then
   for _, n in ipairs(nodeIds) do
     io.write("\n-- ##################### node: " .. n .. " #####################\n\n")
-    io.write(emitNode(net, n, routes[n]))
+    io.write(emitNode(net, n, routes[n], paths[n]))
   end
   printMatrix(net, routes, stationIds, io.stderr)   -- keep stdout pure config
 else
@@ -391,7 +492,7 @@ else
     f:write(content); f:close()
   end
   for _, n in ipairs(nodeIds) do
-    local block = fileHeader(n, netPath) .. emitNode(net, n, routes[n])
+    local block = fileHeader(n, netPath) .. emitNode(net, n, routes[n], paths[n])
     write(outdir .. "/" .. n .. ".lua", block)
     if wantStartup then
       -- splice the SAME block install.lua reads from <node>.lua, so both agree
