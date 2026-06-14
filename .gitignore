@@ -9,6 +9,9 @@
 luacov.*.out
 .luacheckcache
 
+# Per-node configs emitted by tools/build_routes.lua (regenerate from the graph)
+config/generated/
+
 # Local notes not meant for the repo
 NOTES.local.md
 scratch/

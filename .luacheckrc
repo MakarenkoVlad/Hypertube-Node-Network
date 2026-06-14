@@ -5,6 +5,11 @@ std = "lua53"
 max_line_length = false
 codes = true
 
+-- Generated per-node blocks are config FRAGMENTS to paste into the firmware's
+-- CONFIG section, not standalone programs — their locals are "unused" in
+-- isolation. They're a build artifact (git-ignored); don't lint them.
+exclude_files = { "config/generated" }
+
 -- CC: Tweaked global APIs (read-only from our code's perspective)
 read_globals = {
   "os", "term", "peripheral", "redstone", "rs", "fs", "shell", "http",
@@ -19,4 +24,10 @@ files["src/*.lua"] = {
   ignore = {
     "542",  -- empty if branch (occasional guard clauses)
   },
+}
+
+-- Off-game build tooling: plain Lua (standard io/os), NOT CC firmware. It reads
+-- its CLI args via `...`, so no extra globals are needed beyond the lua53 std.
+files["tools/*.lua"] = {
+  std = "lua53",
 }

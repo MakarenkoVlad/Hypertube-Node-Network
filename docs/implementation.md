@@ -135,33 +135,54 @@ On each computer: `edit startup`, paste `hypertube_node.lua`, save, reboot. Then
 - `ROUTES` — destination → exit (or `"RELEASE"`).
 - `MODEM`, `MONITOR` (nil for headless junctions), optional `DETECT`.
 
-`config/stations.example.lua` has a complete worked network including the junction. Find peripheral names with `lua` → `peripheral.getNames()`.
+`config/stations.example.lua` has a complete worked network including the junction. Find peripheral names with `lua` → `peripheral.getNames()`. For anything bigger than a few nodes, generate these blocks instead of hand-writing them — see §9.
 
 ---
 
-## 9. Limitations & tradeoffs
+## 9. Auto-generating routes (build step)
+
+Hand-writing ROUTES per node is fine for a few stations but gets error-prone as the network grows: every new station or junction means editing *every* node's table. Since the topology is just a graph, describe it **once** and generate every node's tables by shortest path.
+
+- **Describe the network** in one file — `config/network.example.lua`. It `return`s `{ stations = {...}, nodes = {...} }`, where each node lists its physical `exits` and, per exit, the neighbour it leads `to` (the graph edge) plus the same `relay`/`side`/`invert` gate wiring that goes into EXITS.
+- **Generate** with the off-game build step:
+
+  ```bash
+  lua tools/build_routes.lua config/network.example.lua      # writes config/generated/<node>.lua
+  lua tools/build_routes.lua config/network.example.lua -     # or print the blocks to stdout
+  ```
+
+  For every node it runs a shortest-path (BFS) search to each station and emits that node's next-hop EXITS + ROUTES block (plus STATIONS on any node with a monitor). It prints a routing matrix for review and warns about unreachable destinations.
+- **Deploy** the emitted block by pasting it over the CONFIG section at the top of `src/hypertube_node.lua` on that node, then reboot.
+
+The emitted EXITS/ROUTES are the **same runtime format** the firmware already consumes — nothing in `hypertube_node.lua` changes and hand-written configs keep working. A junction still falls out for free: the generator simply finds that a node with 2+ exits sends different destinations down different tubes.
+
+`tools/build_routes.lua` is the only non-firmware file in the repo: it runs on your dev machine's `lua` (standard Lua I/O), not on an in-game computer. `config/generated/` is git-ignored — it's a build artifact; regenerate it from the graph whenever the topology changes.
+
+---
+
+## 10. Limitations & tradeoffs
 
 - **One traveller at a time** per network (gate states are shared). Fine for a base/SMP; concurrent trips need block-signalling (future work).
-- **Static routing tables** — each node lists its next hop per destination. Clear and flexible; for very large networks you'd generate them (future `routes` builder).
+- **Static routing tables** — each node lists its next hop per destination. Clear and flexible; for larger networks, generate them from a single graph with `tools/build_routes.lua` instead of hand-writing (§9).
 - **Step 0 is load-bearing** — everything assumes hand-off, release, and switch/redirect behave as tested.
 
 ---
 
-## 10. Growth
+## 11. Growth
 
 - **More stations / branches** — add nodes and exits; extend each affected node's ROUTES. A new junction is just a node with another exit.
 - **Cross-dimension** — Ender Modems make a Nether/End station just another node.
 - **Hub-and-spoke** — one node with one exit per base; every base tubes into it; it switches you out the right spoke. Same model, routing concentrated at the hub.
-- **Auto-generated routes** — since the topology is a graph, a small build step could compute each node's ROUTES from a network description (shortest path) instead of hand-writing them.
+- **Auto-generated routes** — the topology is a graph, so `tools/build_routes.lua` computes each node's ROUTES (shortest path) from one network description instead of hand-writing them (§9). Adding a station/branch is then a one-line graph edit plus a regenerate.
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 - **Won't forward / catch:** recheck Step 0 gap + facing; confirm the forward exit is actually powered (clutch un-braked) during the trip.
 - **Junction sends you the wrong way:** check that node's `ROUTES[dest]` and that each `EXITS` name maps to the right physical tube.
 - **Overshoots the stop:** destination node isn't releasing — it should have `ROUTES[dest] = "RELEASE"` (or no entry) for itself.
-- **"No route to X":** this node's ROUTES has no entry for X — add it.
+- **"No route to X":** this node's ROUTES has no entry for X — add it (or, if you generate routes, fix the graph so X is reachable; `tools/build_routes.lua` warns about exactly this and leaves the entry out).
 - **Stuck "Line busy":** no `ARRIVED` received — wire a detector or lower `TRIP_TIMEOUT`.
 - **Relay not found:** the network name doesn't match config — right-click the relay's wired modem to read it.
 - **Modem range warning:** swap the plain modem for an **Ender Modem**.

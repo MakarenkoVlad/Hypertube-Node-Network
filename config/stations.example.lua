@@ -12,6 +12,12 @@
   Copy the matching block into the CONFIG section of src/hypertube_node.lua on
   each computer. The STATIONS directory is the same everywhere (stations only —
   junctions are not destinations, so they are not listed).
+
+  These blocks are hand-written here for reference. The same routes are produced
+  automatically from the network graph:
+      lua tools/build_routes.lua config/network.example.lua
+  (config/network.example.lua describes this exact topology; the generator's
+  ROUTES match the tables below.)
 --]]
 
 -- Shared on every STATION (not needed on the headless junction):

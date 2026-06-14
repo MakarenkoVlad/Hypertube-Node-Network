@@ -40,11 +40,15 @@ README.md                     human overview + quickstart + Claude Code kickoff 
 src/
   hypertube_node.lua          MAIN firmware: station / junction / terminal (routing tables)
   single_room_selector.lua    v1 standalone: one room, one entrance per destination (reference / hub building block)
+tools/
+  build_routes.lua            BUILD STEP (off-game Lua): one network graph -> per-node EXITS/ROUTES by shortest path
 docs/
   implementation.md           full build + protocol doc (canonical design reference)
   single-room-guide.md        build guide for the v1 selector
 config/
-  stations.example.lua        worked multi-node network incl. a switching junction
+  network.example.lua         network graph = single source of truth for the route builder
+  stations.example.lua        worked multi-node network incl. a switching junction (hand-written runtime-format reference)
+  generated/                  build artifact: per-node configs emitted by build_routes.lua (git-ignored)
 test/
   mechanic-test.md            Step 0 in-game verification checklist (BLOCKS real builds)
 .luacheckrc                   luacheck config with CC: Tweaked globals
@@ -62,17 +66,18 @@ test/
 ## How to validate (this machine)
 
 ```bash
-luacheck src/            # static analysis against CC globals (.luacheckrc)
+luacheck src/ tools/                                   # static analysis (.luacheckrc)
+lua tools/build_routes.lua config/network.example.lua -  # build step actually RUNS off-game
 ```
 
-There is **no runtime test harness** — CC: Tweaked can't run here. Before claiming something works: lint clean, reason through the event loop and the routing math by hand, and update the docs. For anything touching the physical mechanic, defer to Step 0.
+The **firmware** (`src/`) can't run here — CC: Tweaked is in-game only. The **build step** (`tools/`) is plain Lua and *does* run on this machine, so exercising it on a graph is a real test: it should reproduce `config/stations.example.lua`'s routes from `config/network.example.lua`. Before claiming firmware works: lint clean, reason through the event loop and routing math by hand, update the docs. For anything touching the physical mechanic, defer to Step 0.
 
-If `luacheck` isn't installed: `luarocks install luacheck` (or `pip`-free; it's a Lua tool). A full-parse fallback is `python3 -c "from luaparser import ast,builder; ast.parse(open('src/hypertube_node.lua').read())"`.
+If `luacheck` isn't installed: `brew install luacheck` (it bundles a compatible Lua) or `luarocks install luacheck`. Note **luacheck does not run on Lua 5.5 yet** (a `const` change breaks it) — use the Homebrew formula's bundled `lua@5.4`. A full-parse fallback is `python3 -c "from luaparser import ast,builder; ast.parse(open('src/hypertube_node.lua').read())"`.
 
 ## Roadmap / open work
 
 - [ ] **Resolve Step 0** and record results in `test/mechanic-test.md`; relax safety nets only if justified.
-- [ ] **Auto-generated ROUTES:** describe the network as a graph once and compute each node's next-hop table (shortest path) instead of hand-writing ROUTES.
+- [x] **Auto-generated ROUTES:** `tools/build_routes.lua` turns one network graph (`config/network.example.lua`) into per-node EXITS/ROUTES by shortest path. Runtime format unchanged; see `docs/implementation.md` §9.
 - [ ] **Concurrent trips / block-signalling** so the network isn't single-occupancy.
 - [ ] **Installer:** one-line `pastebin get` / `wget` or floppy-disk deploy that writes `startup` + drops in per-node config.
 - [ ] **Shared directory distribution:** push the `STATIONS` list to all terminals (rednet or disk) so it isn't copied by hand.
@@ -82,4 +87,5 @@ If `luacheck` isn't installed: `luarocks install luacheck` (or `pip`-free; it's 
 
 - Touch the **protocol** (message shapes/types)? Update `src/hypertube_node.lua`, `docs/implementation.md` §7, and `config/stations.example.lua` together.
 - Add a **config field**? Update the top-of-file block, the example config, and the install section of the docs.
+- Add a **config field the builder should emit**? Update `tools/build_routes.lua`'s `emitNode`, `config/network.example.lua`, and `docs/implementation.md` §9 together — the generated block must stay a drop-in for the firmware's CONFIG section.
 - Keep commits small and message them by what changed and why. Don't mark Step 0 work "done" without recorded in-game results.
