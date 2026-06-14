@@ -122,14 +122,21 @@ if args[1] == "reset" then        -- wipe this node's saved name + calibration, 
   print("Config cleared - rebooting into fresh setup...")
   sleep(1); os.reboot()
 end
-if args[1] == "spin" then         -- identify a tube: spin it ~5s, then exit
+if args[1] == "spin" then         -- identify tubes: spin all (or one) in turn, then exit
   local n = tonumber(args[2])
-  if n and ctrls[n] then
-    print("Spinning tube " .. n .. " for 5s - stand clear...")
-    pcall(ctrls[n].wrap.setTargetSpeed, CALIBRATE_RPM); sleep(5); pcall(ctrls[n].wrap.setTargetSpeed, 0)
-  else
-    print("usage: firmware.lua spin <1.." .. #ctrls .. ">")
+  if n and not ctrls[n] then
+    print("usage: firmware.lua spin [1.." .. #ctrls .. "]   (no number = all)"); return
   end
+  print("Spinning " .. (n and ("tube " .. n) or (#ctrls .. " tubes")) .. ". STEP OFF THE PAD - 5s...")
+  for s = 5, 1, -1 do io.write(s .. " "); sleep(1) end
+  print("")
+  for i = 1, #ctrls do
+    if not n or n == i then
+      print("Tube " .. i .. " spinning...")
+      pcall(ctrls[i].wrap.setTargetSpeed, CALIBRATE_RPM); sleep(4); pcall(ctrls[i].wrap.setTargetSpeed, 0); sleep(1)
+    end
+  end
+  print("Done. Now run: firmware.lua setup")
   return
 end
 if args[1] == "setup" then        -- explicit setup mode: run it (typeable) and exit
