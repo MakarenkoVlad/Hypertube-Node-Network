@@ -77,6 +77,25 @@ local function saveCfg(c)
   pcall(function() local f = fs.open(CFG, "w"); f.write(textutils.serialize(c)); f.close() end)
 end
 
+-- Roll-call: ask every node to announce, collect the names that answer within
+-- `secs`. Returns a set {name=true,...} and whether a modem was open to ask with.
+local function probeNetwork(secs)
+  local known = {}
+  if not rednet.isOpen() then return known, false end
+  pcall(rednet.broadcast, { type = "LSREQ" }, PROTO)
+  local timer = os.startTimer(secs or 2.5)
+  while true do
+    local e = { os.pullEvent() }
+    if e[1] == "rednet_message" and e[4] == PROTO then
+      local m = e[3]
+      if type(m) == "table" and m.type == "LS" and m.name then known[m.name] = true end
+    elseif e[1] == "timer" and e[2] == timer then
+      break
+    end
+  end
+  return known, true
+end
+
 -- interactive first-time setup (uses the computer terminal)
 local function runSetup()
   -- Setup must own the keyboard. Stop every tube (so nothing spins/launches) and
@@ -93,31 +112,66 @@ local function runSetup()
   os.queueEvent("ht_drain"); repeat until select(1, os.pullEvent()) == "ht_drain"
   term.clear(); term.setCursorPos(1, 1)
   print("=== HT Node setup ===")
-  write("Name this node (e.g. hub, mine, nether_hub): ")
+
+  -- See who is already on the network: lets us verify names and show spellings.
+  print("Scanning network...")
+  local known, netOk = probeNetwork(2.5)
+  local names = {}; for n in pairs(known) do names[#names + 1] = n end; table.sort(names)
+  local canCheck = netOk and #names > 0
+  if not netOk then            print("(no modem - names can't be verified)")
+  elseif #names == 0 then      print("Online now: (none yet - skipping checks)")
+  else                         print("Online now: " .. table.concat(names, ", ")) end
+
+  -- Read a neighbour name on its OWN line (always fully visible). When other
+  -- nodes are online, verify it's really one of them and let you retype a typo.
+  -- Enter alone = skip / done.
+  local function askNode(label)
+    while true do
+      print(""); print(label); write("> ")
+      local v = read()
+      if not v or v == "" then return nil end
+      if not canCheck or known[v] then
+        if canCheck then print("  ok - '" .. v .. "' is online.") end
+        return v
+      end
+      print("  ! no node named '" .. v .. "' is online.")
+      print("    online: " .. table.concat(names, ", "))
+      write("  use it anyway? (y/N): ")
+      local yn = read()
+      if yn == "y" or yn == "Y" then return v end
+    end
+  end
+
+  print("")
+  print("Name this node (hub, mine, nether_hub):")
+  write("> ")
   local name = read()
-  while not name or name == "" do write("Name: "); name = read() end
+  while not name or name == "" do write("> "); name = read() end
+  if canCheck and known[name] then
+    print("  ! '" .. name .. "' is already on the network - names must be")
+    print("    unique (continue only if you're replacing that node).")
+  end
 
   local links = {}     -- controllerPeripheralName -> neighbour node name (tube)
   if #ctrls == 0 then
+    print("")
     print("(No controllers found - this node has no tubes of its own.)")
   else
-    -- Stay at the keyboard. Nothing spins here, so you can't be launched and the
-    -- terminal stays focused. Identify a tube anytime with: firmware.lua spin <n>
-    print(("This node has %d tube(s). Type where each one goes."):format(#ctrls))
-    print("(Unsure which is which? Quit with Ctrl+T, run: firmware.lua spin 1)")
+    print("")
+    print(("This node has %d tube(s). For each, type the node"):format(#ctrls))
+    print("it reaches. Enter alone skips a tube.")
+    print("(ID a tube: Ctrl+T, then  firmware.lua spin 1)")
     os.queueEvent("ht_drain"); repeat until select(1, os.pullEvent()) == "ht_drain"
     for i = 1, #ctrls do
-      write(("  Tube %d goes to which node? (name, Enter = skip): "):format(i))
-      local nb = read()
-      if nb and nb ~= "" then links[ctrls[i].name] = nb end
+      local nb = askNode("Tube " .. i .. " goes to which node?")
+      if nb then links[ctrls[i].name] = nb end
     end
   end
 
   local portals = {}   -- neighbour node names reached by walking through a portal
   while true do
-    write("Portal walk-through to another node? (name, Enter = done): ")
-    local p = read()
-    if not p or p == "" then break end
+    local p = askNode("Portal (walk-through) to which node? (Enter=none)")
+    if not p then break end
     portals[#portals + 1] = p
   end
 
