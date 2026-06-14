@@ -21,7 +21,7 @@
 --]]
 
 local RPM           = 128
-local CALIBRATE_RPM = 7      -- gentle spin during the setup "parade" (you stand clear)
+local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
 local TRIP_TIMEOUT  = 30     -- seconds before a stale trip auto-clears
 local LS_INTERVAL  = 15      -- seconds between link-state broadcasts
 local PROTO        = "hypertube"
@@ -89,24 +89,15 @@ local function runSetup()
   if #ctrls == 0 then
     print("(No controllers found - this node has no tubes of its own.)")
   else
-    -- PHASE 1: spin each tube in turn so you can see which is which. No typing
-    -- here, so a tube grabbing you doesn't matter - but stand clear anyway.
-    print(("%d tubes. STEP 1: I'll spin each in turn. Stand CLEAR of the pad so"):format(#ctrls))
-    print("a tube can't launch you, and note which tube is #1, #2, ...")
-    write("Press Enter, then step back - 5s countdown... "); read()
-    for s = 5, 1, -1 do io.write(s .. " "); sleep(1) end
-    print("")
-    for i, c in ipairs(ctrls) do
-      print(("Spinning Tube %d of %d ..."):format(i, #ctrls))
-      pcall(c.wrap.setTargetSpeed, CALIBRATE_RPM); sleep(3); pcall(c.wrap.setTargetSpeed, 0)
-      sleep(1)
-    end
-    -- PHASE 2: nothing spins now, so it's safe to stand at the keyboard and type.
-    print("STEP 2: name them. Nothing is spinning now - safe to type.")
-    for i, c in ipairs(ctrls) do
+    -- Stay at the keyboard. Nothing spins here, so you can't be launched and the
+    -- terminal stays focused. Identify a tube anytime with: firmware.lua spin <n>
+    print(("This node has %d tube(s). Type where each one goes."):format(#ctrls))
+    print("(Unsure which is which? Quit with Ctrl+T, run: firmware.lua spin 1)")
+    sleep(0.3)   -- drain any stray keypresses so the prompts don't auto-skip
+    for i = 1, #ctrls do
       write(("  Tube %d goes to which node? (name, Enter = skip): "):format(i))
       local nb = read()
-      if nb and nb ~= "" then links[c.name] = nb end
+      if nb and nb ~= "" then links[ctrls[i].name] = nb end
     end
   end
 
@@ -126,6 +117,16 @@ end
 
 local cfg = loadCfg()
 local netUp = openModem()
+if args[1] == "spin" then         -- identify a tube: spin it ~5s, then exit
+  local n = tonumber(args[2])
+  if n and ctrls[n] then
+    print("Spinning tube " .. n .. " for 5s - stand clear...")
+    pcall(ctrls[n].wrap.setTargetSpeed, CALIBRATE_RPM); sleep(5); pcall(ctrls[n].wrap.setTargetSpeed, 0)
+  else
+    print("usage: firmware.lua spin <1.." .. #ctrls .. ">")
+  end
+  return
+end
 if args[1] == "setup" then        -- explicit setup mode: run it (typeable) and exit
   runSetup(); return
 end
@@ -175,8 +176,14 @@ local function pathTo(dest)
 end
 
 local function reachable()      -- sorted list of node names this node can route to
+  local seen, cand = {}, {}
+  local function add(n) if not seen[n] then seen[n] = true; cand[#cand + 1] = n end end
+  for node, nbrs in pairs(graph) do        -- include nodes that announced...
+    add(node)
+    for _, nb in ipairs(nbrs) do add(nb) end  -- ...and any node named as a neighbour
+  end
   local out = {}
-  for node in pairs(graph) do
+  for _, node in ipairs(cand) do
     if node ~= NAME and pathTo(node) then out[#out + 1] = node end
   end
   table.sort(out)
