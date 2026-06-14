@@ -117,6 +117,11 @@ end
 
 local cfg = loadCfg()
 local netUp = openModem()
+if args[1] == "reset" then        -- wipe this node's saved name + calibration, then reboot
+  if fs.exists(CFG) then fs.delete(CFG) end
+  print("Config cleared - rebooting into fresh setup...")
+  sleep(1); os.reboot()
+end
 if args[1] == "spin" then         -- identify a tube: spin it ~5s, then exit
   local n = tonumber(args[2])
   if n and ctrls[n] then
