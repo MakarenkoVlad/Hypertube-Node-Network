@@ -23,7 +23,7 @@
 local RPM           = 128
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
 local TRIP_TIMEOUT  = 30     -- seconds before a stale trip auto-clears
-local LS_INTERVAL  = 15      -- seconds between link-state broadcasts
+local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
 local PROTO        = "hypertube"
 local CFG          = "/ht_node.cfg"
 local BOARD_RANGE  = 2
@@ -382,8 +382,10 @@ allStop()
 if not netUp then print("[warn] no modem - this node can't see the network.") end
 broadcastLS()
 rednet.broadcast({ type = "LSREQ" }, PROTO)     -- ask everyone to announce
-local lsTimer = os.startTimer(LS_INTERVAL)
-local padTimer = os.startTimer(1)
+local lsTimer   = os.startTimer(LS_INTERVAL)
+local padTimer  = os.startTimer(1)
+local warm      = 5                              -- quick extra roll-calls right after
+local warmTimer = os.startTimer(0.5)             -- boot so we converge in ~1-2s, not 15s
 refresh()
 
 while true do
@@ -396,6 +398,12 @@ while true do
     if e[4] == PROTO then handle(e[3]) end
   elseif ev == "timer" then
     if e[2] == lsTimer then broadcastLS(); lsTimer = os.startTimer(LS_INTERVAL)
+    elseif e[2] == warmTimer then
+      if warm > 0 then
+        warm = warm - 1
+        rednet.broadcast({ type = "LSREQ" }, PROTO); broadcastLS()
+        warmTimer = os.startTimer(0.5)
+      end
     elseif e[2] == tripTimer then clearTrip()
     elseif e[2] == padTimer then
       -- destination arrival clears the trip; otherwise just refresh the greeting
