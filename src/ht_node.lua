@@ -22,8 +22,10 @@
 
 local RPM           = 128
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
-local TRIP_TIMEOUT  = 30     -- seconds before a stale trip auto-clears
+local TRIP_TIMEOUT  = 12     -- seconds before a trip's gates auto-release
+local PRESPIN       = 1.0    -- s: at a multi-hop start, let downstream junctions spin up before launch
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
+local STALE_SEC    = 30      -- forget a node whose state we haven't refreshed in this long
 local PROTO        = "hypertube"
 local CFG          = "/ht_node.cfg"
 local BOARD_RANGE  = 2
@@ -224,13 +226,45 @@ local function myNeighbours()
   return out
 end
 
--- ---- network graph (link-state) ------------------------------------------
-local graph = { [NAME] = myNeighbours() }   -- node -> { neighbour, ... }
+-- ---- shared network map (gossiped link-state) ----------------------------
+-- Every node keeps the WHOLE map (node -> {neighbours}); `gen` holds when each
+-- node last refreshed itself. Nodes gossip the entire map, so ONE reply hands a
+-- newcomer the complete network at once. The timestamps make merges safe (a
+-- node's own fresh news always beats a stale gossiped copy) and let everyone
+-- forget a node that has gone quiet.
+local graph = { [NAME] = myNeighbours() }    -- node -> { neighbour, ... }
+local gen   = { [NAME] = os.epoch("utc") }   -- node -> last-refresh epoch (ms)
 
 local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComputerLabel(NAME) end end
 
-local function broadcastLS()
-  rednet.broadcast({ type = "LS", name = NAME, neighbours = myNeighbours() }, PROTO)
+-- forget nodes we haven't heard a fresh timestamp for (automatic dead-node removal)
+local function pruneStale()
+  local now = os.epoch("utc")
+  for n, ts in pairs(gen) do
+    if n ~= NAME and (now - ts) > STALE_SEC * 1000 then graph[n] = nil; gen[n] = nil end
+  end
+end
+
+-- refresh our own row, then gossip the ENTIRE known map
+local function broadcastState()
+  graph[NAME] = myNeighbours(); gen[NAME] = os.epoch("utc")
+  pruneStale()
+  local nodes = {}
+  for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
+  rednet.broadcast({ type = "STATE", nodes = nodes }, PROTO)
+end
+
+-- merge a gossiped map; per node, keep the newer timestamp. true if anything changed.
+local function mergeState(nodes)
+  if type(nodes) ~= "table" then return false end
+  local changed = false
+  for n, info in pairs(nodes) do
+    if type(info) == "table" and type(info.nbrs) == "table" then
+      local ts = tonumber(info.ts) or 0
+      if not gen[n] or ts > gen[n] then graph[n] = info.nbrs; gen[n] = ts; changed = true end
+    end
+  end
+  return changed
 end
 
 -- shortest path NAME..dest over the (undirected) graph; nil if unreachable
@@ -254,6 +288,7 @@ local function pathTo(dest)
 end
 
 local function reachable()      -- sorted list of node names this node can route to
+  pruneStale()
   local seen, cand = {}, {}
   local function add(n) if not seen[n] then seen[n] = true; cand[#cand + 1] = n end end
   for node, nbrs in pairs(graph) do        -- include nodes that announced...
@@ -349,27 +384,38 @@ end
 local function clearTrip() active, hint = nil, nil; allStop(); refresh() end
 
 local function startTrip(dest)
-  if active then refresh(); return end
   if dest == NAME then return end
+  -- debounce accidental double-taps, but DON'T hard-lock: re-tapping re-routes
+  if active and (os.epoch("utc") - (active.ts or 0)) < 1500 then return end
   local path = pathTo(dest)
   if not path then draw("No route to " .. dest, colors.red); return end
   local rider = riderOnPad()
   if detector and not rider then draw("Step onto the pad first", colors.orange); return end
   local now = os.epoch("utc")
   local t = { type = "ROUTE", id = now, from = NAME, to = dest, path = path, rider = rider, ts = now }
-  rednet.broadcast(t, PROTO)
-  active = t; hint = applyTrip(t); armTimeout(); refresh()
+  rednet.broadcast(t, PROTO)                 -- tell every hop on the path to open its gate FIRST
+  active = t; armTimeout()
+  if #path > 2 then
+    -- multi-hop: give the downstream junction(s) a beat to spin up to speed, so the
+    -- next entrance is already open when the rider reaches it, then launch.
+    draw(("Routing via %d stop(s)..."):format(#path - 2), colors.orange)
+    sleep(PRESPIN)
+  end
+  hint = applyTrip(t); refresh()             -- now open OUR gate and launch the rider
 end
 
 local function handle(msg)
   if type(msg) ~= "table" then return end
-  if msg.type == "LS" and msg.name then
-    graph[msg.name] = msg.neighbours or {}
+  if msg.type == "STATE" then
+    if mergeState(msg.nodes) and not active then refresh() end
+  elseif msg.type == "LS" and msg.name then            -- legacy single-node announce (transition)
+    graph[msg.name] = msg.neighbours or {}; gen[msg.name] = os.epoch("utc")
     if not active then refresh() end
   elseif msg.type == "LSREQ" then
-    broadcastLS()
+    broadcastState()
   elseif msg.type == "ROUTE" and msg.path then
-    if active and active.id ~= msg.id then return end   -- single trip at a time
+    -- Always (re)apply OUR gate for the newest route. A junction must never stay
+    -- shut because an earlier trip hasn't cleared yet - the latest route wins.
     active = msg; hint = applyTrip(msg); armTimeout(); refresh()
   elseif msg.type == "ARRIVED" then
     clearTrip()
@@ -380,7 +426,7 @@ end
 setNameLabel()
 allStop()
 if not netUp then print("[warn] no modem - this node can't see the network.") end
-broadcastLS()
+broadcastState()
 rednet.broadcast({ type = "LSREQ" }, PROTO)     -- ask everyone to announce
 local lsTimer   = os.startTimer(LS_INTERVAL)
 local padTimer  = os.startTimer(1)
@@ -397,11 +443,11 @@ while true do
   elseif ev == "rednet_message" then
     if e[4] == PROTO then handle(e[3]) end
   elseif ev == "timer" then
-    if e[2] == lsTimer then broadcastLS(); lsTimer = os.startTimer(LS_INTERVAL)
+    if e[2] == lsTimer then broadcastState(); lsTimer = os.startTimer(LS_INTERVAL)
     elseif e[2] == warmTimer then
       if warm > 0 then
         warm = warm - 1
-        rednet.broadcast({ type = "LSREQ" }, PROTO); broadcastLS()
+        rednet.broadcast({ type = "LSREQ" }, PROTO); broadcastState()
         warmTimer = os.startTimer(0.5)
       end
     elseif e[2] == tripTimer then clearTrip()
