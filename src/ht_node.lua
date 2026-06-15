@@ -22,17 +22,18 @@
 
 local RPM           = 128
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
-local TRIP_TIMEOUT  = 12     -- seconds before a trip's gates auto-release
+local TRIP_TIMEOUT  = 30     -- seconds a trip stays alive (longer: multi-hop with chunk-load delays)
+local TRIP_BEAT     = 2      -- s: re-broadcast the active trip so a node that just loaded catches it
 local RELAUNCH_HOLD = 3      -- s a junction keeps its exit spinning after catching the rider
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
-local STALE_SEC    = 30      -- forget a node whose state we haven't refreshed in this long
+local GRAPHFILE    = "/ht_graph.dat"  -- durable copy of the network map (survives reboot / chunk unload)
 local PROTO        = "hypertube"
 local CFG          = "/ht_node.cfg"
 local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v8"        -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v10"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 
@@ -195,10 +196,15 @@ if args[1] == "log" then          -- print this node's local log and exit
   else print("(no log yet)") end
   return
 end
-if args[1] == "reset" then        -- wipe this node's saved name + calibration, then reboot
+if args[1] == "reset" then        -- wipe this node's name + calibration + learned map, then reboot
   if fs.exists(CFG) then fs.delete(CFG) end
+  if fs.exists(GRAPHFILE) then fs.delete(GRAPHFILE) end
   print("Config cleared - rebooting into fresh setup...")
   sleep(1); os.reboot()
+end
+if args[1] == "forget" then       -- drop only the learned map (re-learn topology); keep name + links
+  if fs.exists(GRAPHFILE) then fs.delete(GRAPHFILE) end
+  print("Map cleared - rebooting..."); sleep(1); os.reboot()
 end
 if args[1] == "spin" then         -- identify tubes: spin all (or one) in turn, then exit
   local n = tonumber(args[2])
@@ -254,19 +260,35 @@ local gen   = { [NAME] = os.epoch("utc") }   -- node -> last-refresh epoch (ms)
 
 local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComputerLabel(NAME) end end
 
--- forget nodes we haven't heard a fresh timestamp for (automatic dead-node removal)
-local function pruneStale()
-  local now, dead = os.epoch("utc"), {}
-  for n, ts in pairs(gen) do
-    if n ~= NAME and (now - ts) > STALE_SEC * 1000 then dead[#dead + 1] = n end
-  end
-  for _, n in ipairs(dead) do graph[n] = nil; gen[n] = nil end
+-- Durable topology. Persist the whole map so this node can route even when other
+-- nodes are unloaded (their computers are off). We do NOT forget a quiet node -
+-- quiet almost always means "chunk unloaded", not "removed" (use `forget` to drop
+-- the map deliberately). Timestamps still keep live merges correct (fresher wins).
+local function saveGraph()
+  pcall(function()
+    local f = fs.open(GRAPHFILE, "w")
+    if f then f.write(textutils.serialize({ graph = graph, gen = gen })); f.close() end
+  end)
 end
+local function loadGraph()
+  if not fs.exists(GRAPHFILE) then return end
+  pcall(function()
+    local f = fs.open(GRAPHFILE, "r"); local d = textutils.unserialize(f.readAll() or ""); f.close()
+    if type(d) == "table" and type(d.graph) == "table" then
+      for n, nbrs in pairs(d.graph) do
+        if n ~= NAME and type(nbrs) == "table" then        -- our own row stays authoritative
+          graph[n] = nbrs; gen[n] = (type(d.gen) == "table" and d.gen[n]) or 0
+        end
+      end
+    end
+  end)
+end
+loadGraph()   -- begin from the last-known topology, so routing works before anyone announces
 
 -- refresh our own row, then gossip the ENTIRE known map
 local function broadcastState()
   graph[NAME] = myNeighbours(); gen[NAME] = os.epoch("utc")
-  pruneStale()
+  saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
   rednet.broadcast({ type = "STATE", nodes = nodes }, PROTO)
@@ -282,6 +304,7 @@ local function mergeState(nodes)
       if not gen[n] or ts > gen[n] then graph[n] = info.nbrs; gen[n] = ts; changed = true end
     end
   end
+  if changed then saveGraph() end
   return changed
 end
 
@@ -306,7 +329,6 @@ local function pathTo(dest)
 end
 
 local function reachable()      -- sorted list of node names this node can route to
-  pruneStale()
   local seen, cand = {}, {}
   local function add(n) if not seen[n] then seen[n] = true; cand[#cand + 1] = n end end
   for node, nbrs in pairs(graph) do        -- include nodes that announced...
@@ -457,11 +479,18 @@ local function handle(msg)
     if not active then refresh() end
   elseif msg.type == "LSREQ" then
     broadcastState()
+  elseif msg.type == "TRIPREQ" then
+    if active then rednet.broadcast(active, PROTO) end    -- relay an in-progress trip to a node that just (re)loaded
   elseif msg.type == "ROUTE" and msg.path then
-    -- Always (re)apply OUR gate for the newest route. A junction must never stay
-    -- shut because an earlier trip hasn't cleared yet - the latest route wins.
-    active = msg; hint = applyTrip(msg); armTimeout(); refresh()
-    if hint then log("route " .. (msg.to or "?") .. " : " .. hint) end   -- only when we're on the path
+    -- A node that just loaded picks the trip up here. Only fire our gate the FIRST time we
+    -- see a trip id; later re-broadcasts just keep it alive (so the origin gate, already
+    -- auto-closed, doesn't re-open and re-grab the rider).
+    local same = active and active.id == msg.id
+    active = msg; armTimeout()
+    if not same then
+      hint = applyTrip(msg); refresh()
+      if hint then log("route " .. (msg.to or "?") .. " : " .. hint) end
+    end
   elseif msg.type == "ARRIVED" then
     log("arrived at " .. (msg.at or "?") .. " - trip done")
     clearTrip()
@@ -475,8 +504,10 @@ log(("boot firmware %s | tubes=%d detector=%s modem=%s"):format(VERSION, #ctrls,
 if not netUp then print("[warn] no modem - this node can't see the network.") end
 broadcastState()
 rednet.broadcast({ type = "LSREQ" }, PROTO)     -- ask everyone to announce
+rednet.broadcast({ type = "TRIPREQ" }, PROTO)   -- on (re)load, catch up on any trip already in progress
 local lsTimer   = os.startTimer(LS_INTERVAL)
 local padTimer  = os.startTimer(1)
+local beatTimer = os.startTimer(TRIP_BEAT)
 local warm      = 5                              -- quick extra roll-calls right after
 local warmTimer = os.startTimer(0.5)             -- boot so we converge in ~1-2s, not 15s
 refresh()
@@ -505,9 +536,10 @@ while true do
         warmTimer = os.startTimer(0.5)
       end
     elseif e[2] == relaunchStop then
-      -- launch window over: close our exit so a bounce can't re-grab the rider. If we were
-      -- the origin/relay (not the final stop), free our screen back to the destination menu.
-      if active and active.to ~= NAME then clearTrip() else allStop() end
+      allStop()   -- close our launch exit so a bounce can't re-grab the rider; keep the trip for relay
+    elseif e[2] == beatTimer then
+      if active then rednet.broadcast(active, PROTO) end   -- keep relaying so nodes loading mid-route catch it
+      beatTimer = os.startTimer(TRIP_BEAT)
     elseif e[2] == tripTimer then clearTrip()
     elseif e[2] == padTimer then
       if active and active.to == NAME and riderOnPad() then
