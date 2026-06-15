@@ -32,8 +32,9 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION = "v7"         -- bump on every change; shown on the monitor + printed on boot so you
-                             -- can confirm at a glance whether a node actually took the update
+local VERSION  = "v8"        -- bump on every change; shown on the monitor + printed/logged on boot
+local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
+local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 
 -- ---- peripheral discovery (by capability) --------------------------------
 local function findAll(test)
@@ -189,6 +190,11 @@ end
 
 local cfg = loadCfg()
 local netUp = openModem()
+if args[1] == "log" then          -- print this node's local log and exit
+  if fs.exists(LOGFILE) then local f = fs.open(LOGFILE, "r"); print(f.readAll()); f.close()
+  else print("(no log yet)") end
+  return
+end
 if args[1] == "reset" then        -- wipe this node's saved name + calibration, then reboot
   if fs.exists(CFG) then fs.delete(CFG) end
   print("Config cleared - rebooting into fresh setup...")
@@ -221,6 +227,13 @@ end
 local NAME    = cfg.name
 local LINKS   = cfg.links or {}       -- controllerName -> neighbour
 local PORTALS = cfg.portals or {}     -- list of portal neighbours
+
+-- log to the computer screen, a local file, and the live network log channel
+local function log(msg)
+  print(NAME .. ": " .. msg)
+  pcall(function() local f = fs.open(LOGFILE, "a"); if f then f.writeLine(os.epoch("utc") .. " " .. msg); f.close() end end)
+  if rednet.isOpen() then pcall(rednet.broadcast, { node = NAME, ver = VERSION, msg = msg }, LOGPROTO) end
+end
 
 -- my neighbour set (tube + portal)
 local function myNeighbours()
@@ -431,6 +444,7 @@ local function startTrip(dest)
   local now = os.epoch("utc")
   local t = { type = "ROUTE", id = now, from = NAME, to = dest, path = path, rider = rider, ts = now }
   rednet.broadcast(t, PROTO)                 -- tell every hop on the path to open its gate FIRST
+  log("start -> " .. dest .. " via " .. table.concat(path, ">") .. (rider and (" (" .. rider .. ")") or ""))
   active = t; hint = applyTrip(t); armTimeout(); refresh()   -- launch from our pad; junctions
 end                                                          -- catch & relaunch on their own
 
@@ -447,7 +461,9 @@ local function handle(msg)
     -- Always (re)apply OUR gate for the newest route. A junction must never stay
     -- shut because an earlier trip hasn't cleared yet - the latest route wins.
     active = msg; hint = applyTrip(msg); armTimeout(); refresh()
+    if hint then log("route " .. (msg.to or "?") .. " : " .. hint) end   -- only when we're on the path
   elseif msg.type == "ARRIVED" then
+    log("arrived at " .. (msg.at or "?") .. " - trip done")
     clearTrip()
   end
 end
@@ -455,7 +471,7 @@ end
 -- ---- boot ----------------------------------------------------------------
 setNameLabel()
 allStop()
-print("HT node '" .. NAME .. "' firmware " .. VERSION)
+log(("boot firmware %s | tubes=%d detector=%s modem=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp)))
 if not netUp then print("[warn] no modem - this node can't see the network.") end
 broadcastState()
 rednet.broadcast({ type = "LSREQ" }, PROTO)     -- ask everyone to announce
@@ -476,7 +492,10 @@ while true do
       refresh()
     end
   elseif ev == "rednet_message" then
-    if e[4] == PROTO then handle(e[3]) end
+    if e[4] == PROTO then handle(e[3])
+    elseif e[4] == LOGPROTO and type(e[3]) == "table" and e[3].ping then
+      log("here - firmware " .. VERSION)       -- viewer asked who's online; report version
+    end
   elseif ev == "timer" then
     if e[2] == lsTimer then broadcastState(); lsTimer = os.startTimer(LS_INTERVAL)
     elseif e[2] == warmTimer then

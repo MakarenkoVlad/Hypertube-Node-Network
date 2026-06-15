@@ -38,6 +38,7 @@ print("  " .. BASE)
 fetch("src/ht_boot.lua", "startup", true)        -- bootstrap + over-the-air updates
 fetch("src/ht_node.lua", "firmware.lua", true)   -- the ONE firmware, same on every node
 fetch("src/ht_push.lua", "ht_push.lua", false)   -- handy admin tool; optional
+fetch("src/htlog.lua", "htlog.lua", false)       -- live network log viewer; optional
 
 if group and group ~= "" then
   local f = fs.open("ht_group", "w"); f.write(group); f.close()
