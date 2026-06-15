@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v20"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v21"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -304,6 +304,16 @@ end
 if args[1] == "forget" then       -- drop only the learned map (re-learn topology); keep name + links
   if fs.exists(GRAPHFILE) then fs.delete(GRAPHFILE) end
   print("Map cleared - rebooting..."); sleep(1); os.reboot()
+end
+if args[1] == "pin" then          -- freeze this node on its current firmware (skip auto-update)
+  local f = fs.open("/ht_pin", "w"); if f then f.write("pinned"); f.close() end
+  print("Pinned - this node will NOT auto-update. (firmware.lua unpin to re-enable)")
+  return
+end
+if args[1] == "unpin" then        -- re-enable GitHub auto-update on this node
+  if fs.exists("/ht_pin") then fs.delete("/ht_pin") end
+  print("Unpinned - auto-update re-enabled.")
+  return
 end
 if args[1] == "set" then          -- tweak a tunable in-game (persists in /ht_tune.cfg, survives OTA)
   local key, val = args[2], tonumber(args[3])
