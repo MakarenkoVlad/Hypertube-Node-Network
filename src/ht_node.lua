@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v18"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v19"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -876,3 +876,5 @@ while true do
     end
   end
 end
+-- @HT-NODE-EOF  (keep this the LAST line: the bootstrap's auto-update requires it to confirm a
+-- complete, untruncated download before replacing firmware. Do not add anything after it.)

@@ -159,9 +159,12 @@ and protocol by hand. The physical hand-off geometry is the one thing only in-ga
 
 - [ ] **Concurrent trips.** The network is single-occupancy (one trip at a time). True concurrency
       needs block-signalling / per-segment reservation built on the shared trip state.
-- [ ] **Auto-update on boot.** `ht_push` only reaches nodes whose chunks are loaded. A node could fetch
-      the latest `ht_node.lua` from `BASE` on boot so a single `./push.sh` propagates everywhere as
-      chunks load. Requires HTTP allowed in-game and accepting that a bad push propagates.
+- [x] **Auto-update on boot.** `ht_boot.lua` fetches `ht_node.lua` from `BASE` on every boot and installs
+      it if strictly newer, so one `./push.sh` propagates to every node as its chunk loads (`ht_push` stays
+      as an instant path for already-loaded nodes). Heavily guarded: a download must end with the
+      **`@HT-NODE-EOF` sentinel** (rejects truncation) AND compile (`load`) before it's written; a broken
+      firmware self-heals. Drop `/ht_pin` to freeze a node. **INVARIANT: `ht_node.lua` must end with the
+      `@HT-NODE-EOF` line — never add anything after it, or every node will reject the update as truncated.**
 - [ ] **Speaker chime / per-exit indicator lamps** on departure/arrival.
 - [ ] Record confirmed in-game hand-off geometry (gap, facing, lock mode) in `docs/unified-node.md`.
 

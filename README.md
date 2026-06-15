@@ -73,20 +73,23 @@ name the node, then for each tube type the node it reaches. To ID which tube is 
 direct hop works with no map and teaches the station the whole network, which it saves to disk —
 after that, multi-hop routing is reliable even when other nodes are unloaded.
 
-**Update every node over the air** — edit `src/ht_node.lua`, then from your machine `./push.sh`
-and from any one node:
+**Update every node — push once, it propagates.** Edit `src/ht_node.lua`, then `./push.sh`. That's it.
+Each node **auto-updates from GitHub when its chunk loads** — `ht_boot` fetches the latest firmware on
+boot and installs it if it's newer (config untouched). So as you travel the network, every node pulls
+the new build itself; you never visit nodes to update them. (Downloads are integrity-checked — a
+truncated/garbage fetch is rejected, so a dropped connection can't brick a node; drop a `/ht_pin` file
+to freeze a node on its current firmware.)
 
+For nodes that are **already loaded** (auto-update only fires on boot), push instantly over rednet from
+any one node:
 ```
 wget https://raw.githubusercontent.com/MakarenkoVlad/Hypertube-Node-Network/main/src/ht_node.lua firmware.lua
 ht_push firmware.lua
 ```
 
-Each node replaces its code and reboots; its `/ht_node.cfg` (name + tubes) is untouched.
-
-**Track the rollout.** `ht_push` only reaches nodes whose chunks are *loaded*, so after a push run
-`htlog` and press **V** (or `htlog versions`): every loaded node prints its firmware version, and any
-on an older build is flagged. Load the chunks (travel the line) and re-push/visit-update the stragglers
-until the census is all-green on the newest version.
+**Track the rollout.** Run `htlog` and press **V** (or `htlog versions`): every loaded node prints its
+firmware version, and any on an older build is flagged — load the chunks (travel the line) so they
+auto-update, until the census is all-green on the newest version.
 
 ## On the touchscreen
 

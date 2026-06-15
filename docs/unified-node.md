@@ -136,18 +136,25 @@ wget run <BASE>/src/installer.lua junction   # optional: tag an OTA update-group
 
 Pastebin alternative: fill the codes in `src/pastebin_install.lua`, then `pastebin run <code>`.
 
-**Update over the air** — edit `src/ht_node.lua`, `./push.sh`, then from any one node:
+**Update — push once, it propagates on chunk load.** Edit `src/ht_node.lua`, then `./push.sh`. Every node
+**auto-updates from GitHub when its chunk loads**: `ht_boot` fetches `BASE/src/ht_node.lua` on boot and
+installs it if strictly newer (config untouched). So you push once and never visit a node to update it.
 
+The download is integrity-checked before it's ever written: it must end with the **`@HT-NODE-EOF`
+sentinel** (so a connection dropped mid-transfer is rejected) AND compile as valid Lua, so a partial or
+garbage fetch can't brick a node; a node that's somehow already corrupt self-heals on the next boot. Drop
+a `/ht_pin` file on a node to freeze it on its current firmware. (Maintenance invariant: keep `@HT-NODE-EOF`
+the last line of `ht_node.lua` — nothing after it.)
+
+For nodes that are **already loaded** (auto-update only fires on boot), push instantly over rednet:
 ```
 wget <BASE>/src/ht_node.lua firmware.lua
 ht_push firmware.lua
 ```
 
-`ht_push` reaches only nodes whose chunks are loaded; visit-update any that were offline with the
-same `wget … firmware.lua && reboot`. **Confirm the rollout** with `htlog` → press **V** (or run
-`htlog versions`): it prints a census of every *loaded* node and its firmware version, flagging any on
-an older build. Load the chunks (travel the line) and re-push the stragglers until it's all-green. The
-version is also on each monitor's top-right and on the boot line.
+**Confirm the rollout** with `htlog` → press **V** (or `htlog versions`): a census of every *loaded* node
+and its firmware version, flagging any on an older build. Travel the line so the stragglers' chunks load
+and auto-update, until it's all-green. The version is also on each monitor's top-right and the boot line.
 
 **Operate** (on a node's computer):
 
