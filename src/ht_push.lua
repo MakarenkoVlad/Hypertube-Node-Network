@@ -2,16 +2,20 @@
   HT Push — send a firmware update to every node over rednet. (CC: Tweaked)
   ===========================================================================
   Run on any computer that has an ender modem. Reads a firmware file and
-  broadcasts it; each node keeps its own config and reboots into the new code
-  (see ht_boot.lua). No need to visit nodes.
+  broadcasts it; each node replaces its code and reboots (see ht_boot.lua). The
+  per-node config (/ht_node.cfg) is a separate file and is left untouched, so no
+  node needs visiting.
+
+  NOTE: this only reaches nodes whose chunks are currently LOADED. Visit-update
+  any that were offline with:  wget <raw>/src/ht_node.lua firmware.lua && reboot
 
   Usage:
     ht_push <firmware.lua> [group]
-      <firmware.lua>  the new node firmware (must contain the @HT-CONFIG markers)
+      <firmware.lua>  the new node firmware (usually ht_node.lua fetched as firmware.lua)
       [group]         only update nodes whose /ht_group matches (default: all)
 
   Example:
-    ht_push firmware.lua            -- update every node
+    ht_push firmware.lua            -- update every loaded node
     ht_push firmware.lua junction   -- update only nodes tagged "junction"
 --]]
 
@@ -30,13 +34,6 @@ end
 
 local f = fs.open(src, "r"); local code = f.readAll(); f.close()
 
-if not code:find("@HT-CONFIG-START", 1, true) then
-  -- No markers: the unified ht_node.lua model, whose config lives in a separate
-  -- /ht_node.cfg the update never touches. Whole-file replace is correct here.
-  print("note: no @HT-CONFIG markers - nodes will replace the whole firmware.")
-  print("(fine for ht_node.lua; its config is in /ht_node.cfg and is preserved.)")
-end
-
 local opened = false
 for _, n in ipairs(peripheral.getNames()) do
   if peripheral.hasType(n, "modem") then rednet.open(n); opened = true; break end
@@ -48,4 +45,4 @@ end
 
 rednet.broadcast({ type = "HT_UPDATE", group = group, code = code }, PROTO)
 print(("Pushed %s (%d bytes) to group '%s'."):format(src, #code, group))
-print("Matching nodes will keep their config and reboot into the new firmware.")
+print("Loaded nodes will reboot into the new firmware; their config is preserved.")

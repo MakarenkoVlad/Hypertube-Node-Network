@@ -1,47 +1,172 @@
-# One firmware for every node (`ht_node.lua`)
+# Hypertube Network — design, hardware & protocol reference
 
-The self-organizing path: instead of generating a config per node, you install the **same** program on every computer and it works the rest out itself. This is the recommended way to run and ship the network.
+One firmware (`src/ht_node.lua`) runs on every computer, unchanged. There is no central network
+graph and no per-node generated code — each node discovers its hardware, learns the topology from
+its peers, and routes for itself. This is the canonical reference; `README.md` is the quickstart.
 
-## What each node does on its own
+## 1. What each node does on its own
 
-1. **Discovers its peripherals** by capability — the ender modem, the monitor, the Player Detector, and every Create Rotational Speed Controller. No names to type.
-2. **First boot only — a 1-minute setup** on the computer screen:
-   - you name the node (e.g. `hub`, `mine`, `nether_hub`);
-   - for each tube it **spins the controller** so you can see which one, then you type the node that tube reaches;
-   - optionally you add **portal links** — a neighbour you reach by walking through a Nether portal (no tube).
-   - This is saved to `/ht_node.cfg`. Re-run any time with `firmware.lua setup`.
-3. **Shares its links over rednet** (link-state). Every node hears every other node's links and builds the whole map, so each one can compute shortest paths itself — add a node and the others learn it automatically.
-4. **Routes any node to any node**, switching at junctions. It's the same single-trip-at-a-time shared state as before, just with the graph discovered instead of generated.
+1. **Discovers its peripherals** by capability — the Ender modem, the monitor (largest if several),
+   the Player Detector, and every Create Rotational Speed Controller (one per tube). No names typed.
+2. **First boot — on-screen setup** (saved to `/ht_node.cfg`; re-run with `firmware.lua setup`):
+   - name the node (e.g. `hub`, `mine`, `nether_hub`);
+   - for each tube, type which node it reaches (use `firmware.lua spin` first to see which tube is which);
+   - optionally add **portal links** — a neighbour reached by walking through a portal (no tube).
+3. **Gossips the topology** over rednet — every node holds the whole map and computes shortest paths
+   itself. Add a node and the rest learn it automatically.
+4. **Routes any node to any node**, opening only the tube toward the next hop at each junction.
 
-## Nether / other dimensions
+### The boarding menu
 
-**Ender modems are cross-dimension**, so the rednet link-state and live trips already span the Overworld, Nether, and End. A hypertube can't physically cross a portal, so a cross-dimension hop is a **portal link**: the route brings you to the portal node, the screen says *"Walk through the portal to <node>,"* and the node on the far side — which already has the trip from the shared broadcast — resumes it when its detector sees you arrive. Verified in routing tests (e.g. `a → b → n1 → n2` crosses a portal at `b`).
+The Advanced Monitor shows a control bar — **Sort** (tap to cycle nearest-first → farthest-first → A–Z)
+and **Find** (tap for an on-screen keyboard that filters the list by name substring) — over a scrollable
+list where each stop shows its **hop-distance** (`direct` / `N hops`). A **▲/▼** bar appears when the list
+overflows. Tap a stop to travel. Hop-distance comes from the same shortest-path used for routing.
 
-## Install — identical on every node
+## 2. Hardware per node
 
-One line per computer (see `docs/shipping.md` for hosting):
+- **Advanced Computer** (gold) — runs the firmware. Advanced so the colour touch menu renders.
+- **Advanced Monitor** — the destination menu; tap to travel.
+- **Ender Modem** on the computer — the only link between nodes. Wireless and **cross-dimension**,
+  so the network spans Overworld/Nether/End with no cabling between nodes.
+- **Player Detector** (Advanced Peripherals, type `player_detector`) at the boarding pad — greets the
+  rider, gates launches until someone is on the pad, and confirms arrival.
+- One **Create Rotational Speed Controller (RSC)** per tube entrance, on the computer's wired network.
+
+### One node = one isolated wired network
+
+The computer connects by **networking cable + wired modems** to **only its own** monitor, detector,
+and controllers. **Never** bridge two nodes onto one wired network — if you do, every computer sees
+every peripheral, reports the wrong tube count, and several computers fight over one monitor. The
+Ender modem (wireless) is the *only* thing that should cross between nodes. Use `firmware.lua diag`
+to see exactly what one computer sees; more than one monitor or detector is the tell-tale of a
+shared network.
+
+### Gates
+
+A tube is **opened** by spinning its controller (`setTargetSpeed(RPM)`, `RPM = 128`) and **closed**
+with `setTargetSpeed(0)`. Create: Hypertubes entrances need **≥16 RPM** to activate, so the
+calibration spin (`firmware.lua spin`) uses 20 RPM — visible but gentle.
+
+### Junction geometry (physical — code can't fix it)
+
+A hypertube ejects you straight out of its mouth. At a junction the through-tube's entrance must
+**catch you at roughly 90°** as you cross it; two entrances pointed **head-on** blow against each
+other and the hand-off fails. A hub (one computer, several tubes around a central pad) is a junction:
+arrange the tubes so each through-route turns rather than meeting an opposing mouth.
+
+## 3. Routing & shared map
+
+- Each node keeps the whole topology: `graph` (node → neighbours) and `gen` (node → last-refresh
+  epoch ms). Nodes broadcast their **entire** known map (`STATE`), so one reply hands a newcomer the
+  full network. On merge, the newer timestamp wins (a node's own fresh news beats a stale gossiped copy).
+- The map is **persisted to `/ht_graph.dat`** and quiet nodes are **not** forgotten — "quiet" almost
+  always means "chunk unloaded", and a node must be able to route to a stop whose computer is off.
+- `pathTo` is BFS shortest path over the undirected graph. A trip is a `ROUTE` carrying the full
+  `path`; each node opens only the tube toward its next hop; the destination releases.
+
+### Seed the map once
+
+A fresh node knows only its own tubes until it hears the map. So after setup, **take one trip from
+each station to its direct neighbour** — a direct hop needs no map, and the reply teaches that
+station the whole network, which it saves. After that, multi-hop is reliable even with other nodes
+unloaded.
+
+## 4. Chunk-tolerance (why multi-hop works with nodes offline)
+
+A CC computer **stops when its chunk unloads** and **cold-boots (RAM wiped, files kept) when it
+reloads**. So a junction is usually *off* when you launch toward it. The firmware copes:
+
+- routes from the **persisted** map even if no peer is online;
+- on boot it sends **`TRIPREQ`**; any still-loaded node holding the active trip relays it, so the
+  junction that just loaded picks up the trip and opens the right exit;
+- the trip is **re-broadcast every `TRIP_BEAT` s**, so a node loading mid-route catches it within
+  a couple seconds;
+- each node fires its gate **once per trip id** (the `same` guard), and the origin auto-closes its
+  launch tube after `RELAUNCH_HOLD` s, so the relay/beat can't re-grab a rider (no suck-back);
+- the destination confirms with **`ARRIVED`** when its detector sees **the trip's own rider** land
+  (matched by name, so a bystander on the destination pad can't complete someone else's trip); if the
+  rider is never detected, the trip clears on `TRIP_TIMEOUT`.
+
+`test/htsim.lua` reproduces exactly this — a trip A→B→C where B and C are unloaded at departure and
+boot as the rider approaches — and asserts the gates, relay, and cleanup behave. Run it after any
+change to routing or the trip/gossip logic.
+
+## 5. Cross-dimension (Nether / End)
+
+Ender modems carry rednet (and the live trip) across dimensions, but a tube can't cross a portal, so
+a cross-dimension hop is a **portal link**. The route brings you to the portal node; its screen says
+*"Walk through the portal to <node>"*; the node on the far side already has the trip from the shared
+broadcast and resumes it when its detector sees you arrive. Add a portal neighbour during setup (the
+"Portal (walk-through) to which node?" prompt); leave it blank for a normal tube-only node.
+
+**Example — a portal to a roof base:** build a portal between your hub and the roof spot; put a node at
+each end (e.g. `hub` and `roof`); on `hub` answer the portal prompt with `roof`, and on `roof` answer it
+with `hub`. Now any stop can route to `roof`: you ride to the hub, the screen says *"Walk through the
+portal to roof,"* you step through, and you're there. A roof/Nether node needs no tubes at all — a
+detector + computer + ender modem is enough. Covered end-to-end by `test/htsim.lua` Phase 11
+(`Surface → Hub → Roof`, where the `Hub → Roof` hop is a portal).
+
+## 6. rednet protocol
+
+Protocol strings: `"hypertube"` (routing/gossip), `"ht_ota"` (updates), `"ht_log"` (the log viewer).
+Messages are typed tables; receivers filter by protocol and guard on shape.
+
+| Type | Sent by | Meaning |
+|---|---|---|
+| `STATE{ nodes }` | boot, heartbeat, on `LSREQ` | full gossiped map; `nodes[name] = { nbrs, ts }`. |
+| `LSREQ{}` | boot, warm-up, setup probe | "everyone announce" — each node replies with `STATE`. |
+| `TRIPREQ{}` | boot | "is a trip in progress for me?" — a holder replies with the `ROUTE`. |
+| `ROUTE{ id,from,to,path,rider,ts }` | start / beat / relay | start or relay a trip; each hop opens its next-hop tube once per `id`. |
+| `ARRIVED{ at,id }` | destination on pad-land | end the trip; every node clears its gates. |
+| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA push; `ht_boot` replaces `/firmware.lua` and reboots. |
+| `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / each node's `log` | version ping / live log line. |
+
+**OTA preserves config because config is a separate file.** `/ht_node.cfg` is independent of
+`/firmware.lua`, so an update is a whole-file replace — nothing in the firmware needs preserving.
+
+## 7. Install / update / operate
+
+**Install** (same on every node — set `BASE` in `src/installer.lua` first):
 
 ```
-wget run <BASE>/installer.lua            # any node
-wget run <BASE>/installer.lua junction   # optional update-group tag
+wget run <BASE>/src/installer.lua            # a normal node
+wget run <BASE>/src/installer.lua junction   # optional: tag an OTA update-group
 ```
 
-It lays down the bootstrap (`startup`) and the one firmware (`firmware.lua`), then reboots into setup. Same command everywhere — no per-node id.
+Pastebin alternative: fill the codes in `src/pastebin_install.lua`, then `pastebin run <code>`.
 
-## Update — over the air
-
-Improve `src/ht_node.lua`, push it to your host, then from any node:
+**Update over the air** — edit `src/ht_node.lua`, `./push.sh`, then from any one node:
 
 ```
 wget <BASE>/src/ht_node.lua firmware.lua
 ht_push firmware.lua
 ```
 
-Every node replaces its firmware and reboots; its `/ht_node.cfg` (name + calibration) is untouched. So **code is one file pushed everywhere; config is per-node and set once on-screen.**
+`ht_push` reaches only nodes whose chunks are loaded; visit-update any that were offline with the
+same `wget … firmware.lua && reboot`. **Confirm the rollout** with `htlog` → press **V** (or run
+`htlog versions`): it prints a census of every *loaded* node and its firmware version, flagging any on
+an older build. Load the chunks (travel the line) and re-push the stragglers until it's all-green. The
+version is also on each monitor's top-right and on the boot line.
 
-## Two models, your choice
+**Operate** (on a node's computer):
 
-- **`ht_node.lua` (this doc)** — self-organizing, identical everywhere, on-screen setup. Best for "one installable thing" and for growing the network freely.
-- **`hypertube_node.lua` + `build_routes.lua`** — central network graph generates each node's config (names/wiring controlled from one file, spliced into firmware). Best when you want the topology defined and reviewed in one place.
+| Command | What |
+|---|---|
+| `firmware.lua setup` | rename / re-map tubes (type on the computer, not the monitor). |
+| `firmware.lua spin [n]` | spin tubes to identify them (step off the pad — 5 s countdown). |
+| `firmware.lua diag` | print name, version, and every peripheral seen; warn on a shared wired network. |
+| `firmware.lua reset` | wipe config + learned map; reboot into fresh setup. |
+| `firmware.lua forget` | drop only the learned map (re-learn topology); keep name + tubes. |
+| `firmware.lua log` | print this node's local event log. |
+| `firmware.lua report` | write a full diagnostic snapshot to `/ht_report.txt` (config, peripherals, map, log) — `pastebin put` it to share. |
+| `firmware.lua set <KEY> <n>` | tweak a tunable in-game (`/ht_tune.cfg`, survives OTA, reboots to apply). Keys: RPM, CALIBRATE_RPM, TRIP_TIMEOUT, TRIP_BEAT, RELAUNCH_HOLD, LS_INTERVAL, BOARD_RANGE, BOARD_HEIGHT. |
 
-Both ride the same ender-modem rednet and the same OTA bootstrap.
+For a whole-network trace, run `htlog` while reproducing an issue — it tees every node's log to
+`/htlog.txt`; `pastebin put /htlog.txt` to share it.
+
+## 8. Limits
+
+- **Single-occupancy** — one trip at a time across the whole network (re-tapping re-routes; a trip
+  clears on arrival or `TRIP_TIMEOUT`). Concurrency is on the roadmap (`CLAUDE.md`).
+- The physical hand-off (gap, facing, lock mode) is only settled in-game; record what works here once confirmed.

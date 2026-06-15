@@ -7,11 +7,10 @@
     * discovers its peripherals by capability (ender modem, monitor, player
       detector, and every Create Rotational Speed Controller);
     * first boot only: a quick on-screen SETUP — name the node, and for each
-      tube it spins the controller so you can see which one, then you type which
-      node that tube reaches. You can also add PORTAL links (walk-through, e.g.
-      Overworld<->Nether) which have no controller;
-    * shares its links over rednet (link-state); every node thus learns the whole
-      graph and computes shortest paths itself;
+      tube you type which node it reaches. You can also add PORTAL links
+      (walk-through, e.g. Overworld<->Nether) which have no controller;
+    * shares its links over rednet (gossiped link-state); every node learns the
+      whole graph and computes shortest paths itself;
     * routes any node to any node, switching at junctions; across a portal it
       tells you to walk through and the node on the far side resumes the trip
       (ender modems carry the shared trip across dimensions).
@@ -22,9 +21,9 @@
 
 local RPM           = 128
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
-local TRIP_TIMEOUT  = 30     -- seconds a trip stays alive (longer: multi-hop with chunk-load delays)
+local TRIP_TIMEOUT  = 30     -- seconds after a trip STARTS that it auto-clears (anchored to trip.ts)
 local TRIP_BEAT     = 2      -- s: re-broadcast the active trip so a node that just loaded catches it
-local RELAUNCH_HOLD = 3      -- s a junction keeps its exit spinning after catching the rider
+local RELAUNCH_HOLD = 3      -- s a junction/origin keeps its exit spinning after launching the rider
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
 local GRAPHFILE    = "/ht_graph.dat"  -- durable copy of the network map (survives reboot / chunk unload)
 local PROTO        = "hypertube"
@@ -33,9 +32,43 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v12"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v17"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
+local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
+local REPORTFILE = "/ht_report.txt"
+
+-- Tunables you can adjust in-game without editing/redeploying code. `firmware.lua set
+-- <KEY> <number>` writes /ht_tune.cfg; loaded here at boot so it survives firmware updates.
+local TUNABLES = { "RPM", "CALIBRATE_RPM", "TRIP_TIMEOUT", "TRIP_BEAT", "RELAUNCH_HOLD", "LS_INTERVAL", "BOARD_RANGE", "BOARD_HEIGHT" }
+-- Safe ranges. Out-of-range values are REJECTED by `set` and CLAMPED at boot, so neither a typo
+-- nor a hand-edited /ht_tune.cfg can wedge a node (RPM<16 never opens a tube, TRIP_TIMEOUT=0 cancels
+-- every trip, LS_INTERVAL/TRIP_BEAT=0 saturate the event loop, etc.).
+local TUNE_MIN = { RPM = 16, CALIBRATE_RPM = 1,   TRIP_TIMEOUT = 5,   TRIP_BEAT = 1,  RELAUNCH_HOLD = 1,  LS_INTERVAL = 1,   BOARD_RANGE = 1,  BOARD_HEIGHT = 1 }
+local TUNE_MAX = { RPM = 256, CALIBRATE_RPM = 256, TRIP_TIMEOUT = 600, TRIP_BEAT = 60, RELAUNCH_HOLD = 60, LS_INTERVAL = 300, BOARD_RANGE = 32, BOARD_HEIGHT = 64 }
+local function clampTune(key, v)              -- numeric + clamped to the key's safe range, else nil
+  v = tonumber(v)
+  if not v or not TUNE_MIN[key] then return nil end
+  return math.max(TUNE_MIN[key], math.min(TUNE_MAX[key], v))
+end
+local tune = {}
+do
+  if fs.exists(TUNEFILE) then
+    local f = fs.open(TUNEFILE, "r")
+    if f then local t = textutils.unserialize(f.readAll() or ""); f.close(); if type(t) == "table" then tune = t end end
+  end
+  RPM           = clampTune("RPM", tune.RPM)                     or RPM
+  CALIBRATE_RPM = clampTune("CALIBRATE_RPM", tune.CALIBRATE_RPM) or CALIBRATE_RPM
+  TRIP_TIMEOUT  = clampTune("TRIP_TIMEOUT", tune.TRIP_TIMEOUT)   or TRIP_TIMEOUT
+  TRIP_BEAT     = clampTune("TRIP_BEAT", tune.TRIP_BEAT)         or TRIP_BEAT
+  RELAUNCH_HOLD = clampTune("RELAUNCH_HOLD", tune.RELAUNCH_HOLD) or RELAUNCH_HOLD
+  LS_INTERVAL   = clampTune("LS_INTERVAL", tune.LS_INTERVAL)     or LS_INTERVAL
+  BOARD_RANGE   = clampTune("BOARD_RANGE", tune.BOARD_RANGE)     or BOARD_RANGE
+  BOARD_HEIGHT  = clampTune("BOARD_HEIGHT", tune.BOARD_HEIGHT)   or BOARD_HEIGHT
+end
+
+local function now() return os.epoch("utc") end
+local function trim(s) return s and (s:gsub("^%s+", ""):gsub("%s+$", "")) or s end
 
 -- ---- peripheral discovery (by capability) --------------------------------
 local function findAll(test)
@@ -48,18 +81,23 @@ local function findAll(test)
   return list
 end
 
-local ctrls = findAll(function(_, p) return p.setTargetSpeed ~= nil end)
-local det   = findAll(function(_, p) return p.getPlayersInRange ~= nil end)[1]
-local detector = det and det.wrap or nil
+local ctrls  = findAll(function(_, p) return p.setTargetSpeed ~= nil end)
+local detAll = findAll(function(_, p) return p.getPlayersInRange ~= nil end)
+local monAll = findAll(function(_, p) return p.setTextScale ~= nil end)
+local detector = detAll[1] and detAll[1].wrap or nil
 
 local mon  -- largest monitor
 do
   local best = -1
-  for _, m in ipairs(findAll(function(_, p) return p.setTextScale ~= nil end)) do
+  for _, m in ipairs(monAll) do
     local ok, w, h = pcall(m.wrap.getSize)
     if ok and w * h > best then best = w * h; mon = m.wrap end
   end
 end
+
+-- More than one monitor or detector on this computer almost always means several
+-- nodes share ONE wired network and see each other's peripherals. Flag it.
+local sharedWarn = (#monAll > 1) or (#detAll > 1)
 
 local function openModem()
   for _, n in ipairs(peripheral.getNames()) do
@@ -92,7 +130,9 @@ local function saveCfg(c)
 end
 
 -- Roll-call: ask every node to announce, collect the names that answer within
--- `secs`. Returns a set {name=true,...} and whether a modem was open to ask with.
+-- `secs`. Nodes answer LSREQ with a STATE message (the whole map); the node
+-- names are the keys of m.nodes. Returns a set {name=true,...} and whether a
+-- modem was open to ask with.
 local function probeNetwork(secs)
   local known = {}
   if not rednet.isOpen() then return known, false end
@@ -102,7 +142,13 @@ local function probeNetwork(secs)
     local e = { os.pullEvent() }
     if e[1] == "rednet_message" and e[4] == PROTO then
       local m = e[3]
-      if type(m) == "table" and m.type == "LS" and m.name then known[m.name] = true end
+      if type(m) == "table" then
+        if m.type == "STATE" and type(m.nodes) == "table" then
+          for n in pairs(m.nodes) do known[n] = true end
+        elseif m.type == "LS" and m.name then          -- legacy single-node announce
+          known[m.name] = true
+        end
+      end
     elseif e[1] == "timer" and e[2] == timer then
       break
     end
@@ -126,6 +172,10 @@ local function runSetup()
   os.queueEvent("ht_drain"); repeat until select(1, os.pullEvent()) == "ht_drain"
   term.clear(); term.setCursorPos(1, 1)
   print("=== HT Node setup ===")
+  if sharedWarn then
+    print("[warn] >1 monitor/detector seen - this computer may share a")
+    print("       wired network with another node. See: firmware.lua diag")
+  end
 
   -- See who is already on the network: lets us verify names and show spellings.
   print("Scanning network...")
@@ -142,7 +192,7 @@ local function runSetup()
   local function askNode(label)
     while true do
       print(""); print(label); write("> ")
-      local v = read()
+      local v = trim(read())
       if not v or v == "" then return nil end
       if not canCheck or known[v] then
         if canCheck then print("  ok - '" .. v .. "' is online.") end
@@ -159,8 +209,8 @@ local function runSetup()
   print("")
   print("Name this node (hub, mine, nether_hub):")
   write("> ")
-  local name = read()
-  while not name or name == "" do write("> "); name = read() end
+  local name = trim(read())
+  while not name or name == "" do write("> "); name = trim(read()) end
   if canCheck and known[name] then
     print("  ! '" .. name .. "' is already on the network - names must be")
     print("    unique (continue only if you're replacing that node).")
@@ -202,15 +252,99 @@ if args[1] == "log" then          -- print this node's local log and exit
   else print("(no log yet)") end
   return
 end
-if args[1] == "reset" then        -- wipe this node's name + calibration + learned map, then reboot
-  if fs.exists(CFG) then fs.delete(CFG) end
-  if fs.exists(GRAPHFILE) then fs.delete(GRAPHFILE) end
-  print("Config cleared - rebooting into fresh setup...")
+if args[1] == "diag" then         -- print what this node sees; warn on a shared wired network
+  print(("HT node diag - firmware %s"):format(VERSION))
+  print("name : " .. (cfg and cfg.name or "(unconfigured)"))
+  print("peripherals:")
+  for _, n in ipairs(peripheral.getNames()) do
+    print(("  %-26s %s"):format(n, peripheral.getType(n) or "?"))
+  end
+  print(("controllers=%d  monitors=%d  detectors=%d  modem=%s"):format(#ctrls, #monAll, #detAll, tostring(netUp)))
+  if sharedWarn then
+    print("[warn] more than one monitor/detector visible.")
+    print("       Likely a SHARED wired network: each node must be on its")
+    print("       OWN isolated wired network. The ender modem is the only")
+    print("       link that should cross between nodes.")
+  end
+  return
+end
+if args[1] == "reset" then        -- wipe name + calibration + learned map + tuning, then reboot
+  for _, p in ipairs({ CFG, GRAPHFILE, TUNEFILE }) do if fs.exists(p) then fs.delete(p) end end
+  print("Config + tuning cleared - rebooting into fresh setup...")
   sleep(1); os.reboot()
 end
 if args[1] == "forget" then       -- drop only the learned map (re-learn topology); keep name + links
   if fs.exists(GRAPHFILE) then fs.delete(GRAPHFILE) end
   print("Map cleared - rebooting..."); sleep(1); os.reboot()
+end
+if args[1] == "set" then          -- tweak a tunable in-game (persists in /ht_tune.cfg, survives OTA)
+  local key, val = args[2], tonumber(args[3])
+  if not key or not TUNE_MIN[key] or not val then
+    print("usage: firmware.lua set <KEY> <number>")
+    print("keys: " .. table.concat(TUNABLES, " "))
+    return
+  end
+  if val < TUNE_MIN[key] or val > TUNE_MAX[key] then   -- reject out-of-range so a typo can't wedge the node
+    print(("%s must be %s..%s (got %s)"):format(key, TUNE_MIN[key], TUNE_MAX[key], val)); return
+  end
+  tune[key] = val
+  local f = fs.open(TUNEFILE, "w"); if f then f.write(textutils.serialize(tune)); f.close() end
+  print(key .. " = " .. val .. " saved. Rebooting to apply..."); sleep(1); os.reboot()
+end
+if args[1] == "report" then       -- write a full diagnostic snapshot to a file you can send for debugging
+  local L = {}
+  local function add(s) L[#L + 1] = s or "" end
+  add("=== HT NODE REPORT (firmware " .. VERSION .. ") ===")
+  add("time(epoch ms): " .. now())
+  add(("computer id=%s label=%s"):format(tostring(os.getComputerID()), tostring(os.getComputerLabel())))
+  add("")
+  add("[config " .. CFG .. "]")
+  add("name: " .. (cfg and cfg.name or "(UNCONFIGURED)"))
+  add("tubes (controller -> neighbour):")
+  if cfg and type(cfg.links) == "table" and next(cfg.links) then
+    for c, nb in pairs(cfg.links) do add(("  %-30s -> %s"):format(c, nb)) end
+  else add("  (none)") end
+  add("portals (walk-through): " .. ((cfg and cfg.portals and #cfg.portals > 0) and table.concat(cfg.portals, ", ") or "(none)"))
+  add("")
+  add("[tuning]  (current effective values)")
+  add(("  RPM=%s CALIBRATE_RPM=%s TRIP_TIMEOUT=%s TRIP_BEAT=%s"):format(RPM, CALIBRATE_RPM, TRIP_TIMEOUT, TRIP_BEAT))
+  add(("  RELAUNCH_HOLD=%s LS_INTERVAL=%s BOARD_RANGE=%s BOARD_HEIGHT=%s"):format(RELAUNCH_HOLD, LS_INTERVAL, BOARD_RANGE, BOARD_HEIGHT))
+  local ov = {}; for k, v in pairs(tune) do ov[#ov + 1] = k .. "=" .. tostring(v) end
+  add("  overrides (" .. TUNEFILE .. "): " .. (#ov > 0 and table.concat(ov, " ") or "none"))
+  add("")
+  add("[peripherals]")
+  for _, n in ipairs(peripheral.getNames()) do add(("  %-28s %s"):format(n, peripheral.getType(n) or "?")) end
+  local msz = "n/a"; if mon then local ok, w, h = pcall(mon.getSize); if ok then msz = w .. "x" .. h end end
+  add(("counts: controllers=%d monitors=%d detectors=%d modem(open)=%s monitor=%s"):format(#ctrls, #monAll, #detAll, tostring(netUp), msz))
+  add("shared-network warning: " .. (sharedWarn and "YES (>1 monitor/detector - isolate wired networks!)" or "no"))
+  add("")
+  add("[network map " .. GRAPHFILE .. "]  (node -> neighbours ; age)")
+  local gf = fs.exists(GRAPHFILE) and fs.open(GRAPHFILE, "r") or nil
+  if gf then
+    local d = textutils.unserialize(gf.readAll() or ""); gf.close()
+    if type(d) == "table" and type(d.graph) == "table" then
+      local names = {}; for nm in pairs(d.graph) do names[#names + 1] = nm end; table.sort(names)
+      for _, nm in ipairs(names) do
+        local age = (type(d.gen) == "table" and d.gen[nm]) and (math.floor((now() - d.gen[nm]) / 1000) .. "s") or "?"
+        add(("  %-22s -> %s   (age %s)"):format(nm, table.concat(d.graph[nm] or {}, ", "), age))
+      end
+    else add("  (unreadable)") end
+  else add("  (no map yet - this node hasn't learned the network)") end
+  add("")
+  add("[recent log " .. LOGFILE .. "]  (last 40 lines)")
+  local lf = fs.exists(LOGFILE) and fs.open(LOGFILE, "r") or nil
+  if lf then
+    local allText = lf.readAll() or ""; lf.close()
+    local lines = {}; for ln in (allText .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = ln end
+    for i = math.max(1, #lines - 40), #lines do if lines[i] ~= "" then add("  " .. lines[i]) end end
+  else add("  (no log yet)") end
+  local outf = fs.open(REPORTFILE, "w")
+  if not outf then print("Could not write " .. REPORTFILE); return end
+  outf.write(table.concat(L, "\n") .. "\n"); outf.close()
+  print("Wrote " .. REPORTFILE .. " (" .. #L .. " lines).")
+  print("Send it to me:  pastebin put " .. REPORTFILE)
+  print("  then paste the URL. (Or read it locally: edit " .. REPORTFILE .. ")")
+  return
 end
 if args[1] == "spin" then         -- identify tubes: spin all (or one) in turn, then exit
   local n = tonumber(args[2])
@@ -243,7 +377,7 @@ local PORTALS = cfg.portals or {}     -- list of portal neighbours
 -- log to the computer screen, a local file, and the live network log channel
 local function log(msg)
   print(NAME .. ": " .. msg)
-  pcall(function() local f = fs.open(LOGFILE, "a"); if f then f.writeLine(os.epoch("utc") .. " " .. msg); f.close() end end)
+  pcall(function() local f = fs.open(LOGFILE, "a"); if f then f.writeLine(now() .. " " .. msg); f.close() end end)
   if rednet.isOpen() then pcall(rednet.broadcast, { node = NAME, ver = VERSION, msg = msg }, LOGPROTO) end
 end
 
@@ -259,10 +393,9 @@ end
 -- Every node keeps the WHOLE map (node -> {neighbours}); `gen` holds when each
 -- node last refreshed itself. Nodes gossip the entire map, so ONE reply hands a
 -- newcomer the complete network at once. The timestamps make merges safe (a
--- node's own fresh news always beats a stale gossiped copy) and let everyone
--- forget a node that has gone quiet.
+-- node's own fresh news always beats a stale gossiped copy).
 local graph = { [NAME] = myNeighbours() }    -- node -> { neighbour, ... }
-local gen   = { [NAME] = os.epoch("utc") }   -- node -> last-refresh epoch (ms)
+local gen   = { [NAME] = now() }             -- node -> last-refresh epoch (ms)
 
 local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComputerLabel(NAME) end end
 
@@ -293,7 +426,7 @@ loadGraph()   -- begin from the last-known topology, so routing works before any
 
 -- refresh our own row, then gossip the ENTIRE known map
 local function broadcastState()
-  graph[NAME] = myNeighbours(); gen[NAME] = os.epoch("utc")
+  graph[NAME] = myNeighbours(); gen[NAME] = now()
   saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
@@ -334,7 +467,8 @@ local function pathTo(dest)
   end
 end
 
-local function reachable()      -- sorted list of node names this node can route to
+-- every node this node can route to, with its hop-distance (path length - 1)
+local function reachable()
   local seen, cand = {}, {}
   local function add(n) if not seen[n] then seen[n] = true; cand[#cand + 1] = n end end
   for node, nbrs in pairs(graph) do        -- include nodes that announced...
@@ -343,34 +477,71 @@ local function reachable()      -- sorted list of node names this node can route
   end
   local out = {}
   for _, node in ipairs(cand) do
-    if node ~= NAME and pathTo(node) then out[#out + 1] = node end
+    if node ~= NAME then
+      local p = pathTo(node)
+      if p then out[#out + 1] = { name = node, dist = #p - 1 } end
+    end
   end
-  table.sort(out)
   return out
 end
 
+-- apply the current filter (case-insensitive substring) + sort mode to reachable()
+local SORTS = { "Dist +", "Dist -", "A-Z" }     -- cycled by the Sort button; 1 = nearest first
+local function orderedDests(filter, sortIdx)
+  local list = reachable()
+  if filter and filter ~= "" then
+    local q = filter:lower()
+    local kept = {}
+    for _, d in ipairs(list) do if d.name:lower():find(q, 1, true) then kept[#kept + 1] = d end end
+    list = kept
+  end
+  local mode = SORTS[sortIdx] or SORTS[1]
+  table.sort(list, function(a, b)
+    if mode == "A-Z" then return a.name < b.name end
+    if a.dist ~= b.dist then                        -- distance modes; ties broken alphabetically
+      if mode == "Dist -" then return a.dist > b.dist end
+      return a.dist < b.dist
+    end
+    return a.name < b.name
+  end)
+  return list
+end
+
 -- ---- gates ---------------------------------------------------------------
+-- IMPORTANT: only ever drive controllers THIS node was configured to own (names
+-- present in LINKS). On a shared wired network `ctrls` also lists neighbours'
+-- controllers; touching those would stop a neighbour's running tube.
 local function controllerToward(nb)            -- the wrapped RSC for a tube neighbour, or nil
   for _, c in ipairs(ctrls) do
     if LINKS[c.name] == nb then return c.wrap end
   end
 end
-local function gateToward(nb)                  -- spin only the tube to nb (nil = stop all)
+local function gateToward(nb)                  -- spin only the owned tube to nb (nil = stop owned)
   for _, c in ipairs(ctrls) do
-    pcall(c.wrap.setTargetSpeed, (nb ~= nil and LINKS[c.name] == nb) and RPM or 0)
+    if LINKS[c.name] then                      -- skip controllers we don't own
+      pcall(c.wrap.setTargetSpeed, (nb ~= nil and LINKS[c.name] == nb) and RPM or 0)
+    end
   end
 end
 local function allStop() gateToward(nil) end
 
--- ---- shared trip state ---------------------------------------------------
-local active, tripTimer = nil, nil
-local relaunchStop = nil                      -- origin auto-close timer (prevents re-catching a bounce)
-local function armTimeout() tripTimer = os.startTimer(TRIP_TIMEOUT) end
+-- ---- trip state ----------------------------------------------------------
+-- `active` is the trip currently moving someone. `tripDeadline` is an ABSOLUTE
+-- wall-clock time (anchored to the trip's start), so periodic re-broadcasts
+-- (beats) can NEVER push it back and livelock the timeout. `done` remembers
+-- recently-finished trip ids so a late beat can't resurrect a cleared trip.
+local active, relaunchStop, tripDeadline = nil, nil, nil
+local done = {}                               -- trip id -> epoch ms after which we forget it
+local hintRef = { text = nil }                -- set by applyTrip's callers; read by refresh
+
+local function markDone(id) if id then done[id] = now() + TRIP_TIMEOUT * 1000 end end
+local function pruneDone() local t = now(); for id, exp in pairs(done) do if t > exp then done[id] = nil end end end
 
 local function indexIn(path) for i, n in ipairs(path) do if n == NAME then return i end end end
 
 -- set this node's gate for a trip and return a human hint for our screen
 local function applyTrip(t)
+  relaunchStop = nil                           -- a new trip supersedes any prior origin auto-close timer
   local i = indexIn(t.path)
   if not i then allStop(); return nil end      -- we're not on this path
   if i == #t.path then allStop(); return ("Arrived: %s"):format(t.rider or "traveller") end
@@ -380,7 +551,7 @@ local function applyTrip(t)
   end
   gateToward(nxt)                              -- open the through-tube and KEEP it open: a 90-deg
                                                -- junction passes the rider, and one who stops at the
-                                               -- open mouth is pulled onward too. No detector needed.
+                                               -- open mouth is pulled onward too.
   if i == 1 then                               -- origin: auto-close shortly after launch so a rider
     relaunchStop = os.startTimer(RELAUNCH_HOLD) -- who bounces back can't be instantly re-grabbed
     return ("Board -> %s"):format(t.to)
@@ -388,60 +559,133 @@ local function applyTrip(t)
   return ("Pass through -> %s"):format(t.to)
 end
 
+local function setActive(t)
+  active = t
+  tripDeadline = (tonumber(t.ts) or now()) + TRIP_TIMEOUT * 1000   -- absolute; immune to beats
+end
+
 -- ---- player presence -----------------------------------------------------
-local function firstName(players)
-  if type(players) ~= "table" then return nil end
-  local p = players[1]
-  if type(p) == "table" then return p.name end
-  return p
-end
-local function riderOnPad()
-  if not detector then return nil end
-  -- Prefer a CUBOID check so the vertical reach can be taller than the horizontal one
-  -- (catches a rider who lands a block above/below the pad). Fall back to a plain range.
+-- names of every player currently within the pad volume (cuboid if the detector
+-- supports it, so vertical reach can be taller; else a plain sphere).
+local function playersOnPad()
+  if not detector then return {} end
+  local players
   if detector.getPlayersInCubic then
-    local ok, players = pcall(detector.getPlayersInCubic, BOARD_RANGE, BOARD_HEIGHT, BOARD_RANGE)
-    if ok then return firstName(players) end
+    local ok, p = pcall(detector.getPlayersInCubic, BOARD_RANGE, BOARD_HEIGHT, BOARD_RANGE)
+    if ok then players = p end
   end
-  local ok, players = pcall(detector.getPlayersInRange, math.max(BOARD_RANGE, BOARD_HEIGHT))
-  if ok then return firstName(players) end
+  if not players then
+    local ok, p = pcall(detector.getPlayersInRange, math.max(BOARD_RANGE, BOARD_HEIGHT))
+    if ok then players = p end
+  end
+  local out = {}
+  if type(players) == "table" then
+    for _, pl in ipairs(players) do
+      local nm = (type(pl) == "table") and pl.name or pl     -- detector may return objects or names
+      if nm then out[#out + 1] = nm end
+    end
+  end
+  return out
 end
+-- the named player if they're on the pad; with name=nil, whoever is on the pad.
+-- Arrival is confirmed against the trip's OWN rider, so a bystander standing on a
+-- destination pad can't falsely complete someone else's trip.
+local function onPad(name)
+  for _, who in ipairs(playersOnPad()) do
+    if not name or who == name then return who end
+  end
+  return nil
+end
+local function riderOnPad() return onPad(nil) end             -- whoever's here (boarding / greeting)
 
 -- ---- UI ------------------------------------------------------------------
-local rowDest, hint = {}, nil
-local scroll, navRow, navMid, pageStep = 0, nil, nil, 1   -- destination list scrolling
-local function draw(status, color)
-  if not mon then return end
-  rowDest, navRow = {}, nil
-  mon.setBackgroundColor(colors.black); mon.clear()
-  local w, h = mon.getSize()
+-- Touch UI: a control bar (Sort cycle + Find), a scrollable destination list
+-- that shows each stop's hop-distance, and an on-screen keyboard for the filter.
+local filter, sortIdx, kbOpen = "", 1, false
+local rowDest = {}                       -- y -> destination name (tappable list rows)
+local navRow, navMid, pageStep, scroll = nil, nil, 1, 0
+local btnSort, btnFind = nil, nil        -- control-bar tap regions {y,x1,x2}
+local kbKeys = {}                        -- on-screen keyboard regions { {y,x1,x2,k}, ... }
+
+local function header(w)
   mon.setBackgroundColor(colors.blue); mon.setCursorPos(1, 1); mon.clearLine()
-  mon.setTextColor(colors.white); mon.setCursorPos(2, 1); mon.write(NAME:sub(1, w - #VERSION - 2))
+  mon.setTextColor(colors.white); mon.setCursorPos(2, 1); mon.write(NAME:sub(1, math.max(1, w - #VERSION - 2)))
   mon.setTextColor(colors.lightGray); mon.setCursorPos(math.max(2, w - #VERSION), 1); mon.write(VERSION)
+end
 
-  local dests = reachable()
-  local top, bottom = 2, h - 1                       -- list rows; status sits on row h
-  local capacity = math.max(1, bottom - top + 1)
-  local paged = #dests > capacity                    -- need a nav row when the list overflows
-  pageStep = math.max(1, paged and (capacity - 1) or capacity)
-  scroll = math.max(0, math.min(scroll, math.max(0, #dests - pageStep)))
+local function drawKeyboard()
+  local w, h = mon.getSize()
+  mon.setBackgroundColor(colors.black); mon.clear(); header(w)
+  kbKeys = {}
+  mon.setBackgroundColor(colors.gray); mon.setCursorPos(1, 2); mon.clearLine()
+  mon.setTextColor(colors.white); mon.setCursorPos(2, 2); mon.write(("Find: %s_"):format(filter):sub(1, w - 1))
+  local keys = "abcdefghijklmnopqrstuvwxyz0123456789"
+  local kw, perRow, y, col = 3, math.max(1, math.floor(w / 3)), 4, 0
+  for i = 1, #keys do
+    if col >= perRow then col = 0; y = y + 1 end
+    if y > h - 1 then break end                       -- keep row h for the control buttons
+    local x1 = col * kw + 1
+    mon.setBackgroundColor(colors.gray); mon.setTextColor(colors.white)
+    mon.setCursorPos(x1, y); mon.write(" " .. keys:sub(i, i) .. " ")
+    kbKeys[#kbKeys + 1] = { y = y, x1 = x1, x2 = x1 + kw - 1, k = keys:sub(i, i) }
+    col = col + 1
+  end
+  local segs = { { k = "spc", l = "space" }, { k = "del", l = "del" }, { k = "clr", l = "clr" }, { k = "ok", l = "OK" } }
+  local segw = math.max(1, math.floor(w / #segs))
+  for i, s in ipairs(segs) do
+    local x1 = (i - 1) * segw + 1
+    if x1 <= w then                                   -- skip any segment that would fall off a tiny screen
+      local x2 = (i == #segs) and w or math.min(w, x1 + segw - 1)
+      mon.setBackgroundColor(s.k == "ok" and colors.green or colors.gray); mon.setTextColor(colors.white)
+      mon.setCursorPos(x1, h); mon.write((" " .. s.l .. string.rep(" ", w)):sub(1, x2 - x1 + 1))
+      kbKeys[#kbKeys + 1] = { y = h, x1 = x1, x2 = x2, k = s.k }
+    end
+  end
+end
 
+local function drawList(status, color)
+  local w, h = mon.getSize()
+  mon.setBackgroundColor(colors.black); mon.clear(); header(w)
+  rowDest, navRow = {}, nil
+  -- control bar (row 2): Sort cycle | Find
+  local sx = math.floor(w / 2)
+  btnSort = { y = 2, x1 = 1, x2 = sx }
+  btnFind = { y = 2, x1 = sx + 1, x2 = w }
+  mon.setCursorPos(1, 2); mon.setBackgroundColor(colors.cyan); mon.setTextColor(colors.black)
+  mon.write((" Sort:" .. SORTS[sortIdx] .. string.rep(" ", w)):sub(1, sx))
+  mon.setBackgroundColor(filter == "" and colors.lightGray or colors.orange)
+  mon.write(((filter == "" and " Find" or (" Find:" .. filter)) .. string.rep(" ", w)):sub(1, w - sx))
+  -- list rows: 3..(h-1), or 3..(h-2) reserving row h-1 for the scroll bar when paged.
+  -- status always sits on row h. All bounds are guarded so a tiny monitor never
+  -- overlaps the control/nav/status rows or draws a phantom row.
+  local dests = orderedDests(filter, sortIdx)
+  local top = 3
+  local cap0 = math.max(0, (h - 1) - top + 1)        -- list capacity if NOT paged (status on row h)
+  local paged = cap0 > 0 and #dests > cap0
+  local bottom = paged and (h - 2) or (h - 1)        -- when paged, the scroll bar takes its own row h-1
+  local capacity = math.max(0, bottom - top + 1)
+  pageStep = math.max(1, capacity)
+  scroll = (capacity > 0) and math.max(0, math.min(scroll, math.max(0, #dests - capacity))) or 0
   local y = top
-  for idx = scroll + 1, math.min(#dests, scroll + pageStep) do
-    local node = dests[idx]
-    mon.setCursorPos(1, y)
-    mon.setBackgroundColor(active and colors.gray or colors.green)
-    mon.setTextColor(colors.white)
-    mon.write(((" " .. node) .. string.rep(" ", w)):sub(1, w))
-    rowDest[y] = node
+  for idx = scroll + 1, math.min(#dests, scroll + capacity) do
+    local d = dests[idx]
+    local tag = (d.dist <= 1) and "direct" or (d.dist .. " hops")
+    mon.setCursorPos(1, y); mon.setBackgroundColor(active and colors.gray or colors.green); mon.setTextColor(colors.white)
+    local left = (" " .. d.name .. string.rep(" ", w)):sub(1, math.max(1, w - #tag - 1))
+    mon.write((left .. tag .. " "):sub(1, w))
+    rowDest[y] = d.name
     y = y + 1
   end
-  if paged then                                      -- nav bar: tap left half = up, right half = down
-    navRow, navMid = bottom, math.floor(w / 2)
+  if #dests == 0 and capacity > 0 then
+    mon.setCursorPos(2, top); mon.setBackgroundColor(colors.black); mon.setTextColor(colors.lightGray)
+    mon.write((filter ~= "" and ("No match for '" .. filter .. "'") or "No stations yet"):sub(1, math.max(1, w - 1)))
+  end
+  if paged then                                      -- scroll bar on its OWN row: left half = up, right = down
+    navRow, navMid = h - 1, math.floor(w / 2)
     mon.setCursorPos(1, navRow)
     mon.setBackgroundColor(scroll > 0 and colors.cyan or colors.gray); mon.setTextColor(colors.white)
-    mon.write((" ^ up" .. string.rep(" ", navMid)):sub(1, navMid))
-    mon.setBackgroundColor((scroll + pageStep) < #dests and colors.cyan or colors.gray)
+    mon.write((" ^ up" .. string.rep(" ", w)):sub(1, navMid))
+    mon.setBackgroundColor((scroll + capacity) < #dests and colors.cyan or colors.gray)
     local rw = w - navMid
     mon.write((string.rep(" ", rw) .. "down v "):sub(-rw))
   end
@@ -449,8 +693,14 @@ local function draw(status, color)
   mon.setCursorPos(1, h); mon.write((status or "Tap a destination"):sub(1, w))
 end
 
+local function draw(status, color)
+  if not mon then return end
+  if kbOpen then drawKeyboard() else drawList(status, color) end
+end
+
 local function refresh()
-  if active then draw(hint or ("Net: " .. (active.rider or "?") .. " -> " .. active.to), colors.orange)
+  if kbOpen then draw(); return end                  -- the filter keyboard owns the screen while open
+  if active then draw(hintRef.text or ("Net: " .. (active.rider or "?") .. " -> " .. active.to), colors.orange)
   elseif detector then
     local who = riderOnPad()
     if who then draw("Welcome, " .. who .. " - tap a destination", colors.lime)
@@ -459,54 +709,70 @@ local function refresh()
 end
 
 -- ---- trips ---------------------------------------------------------------
-local function clearTrip() active, hint = nil, nil; allStop(); refresh() end
+-- end the current trip and remember its id, so a late beat can't resurrect it
+local function endTrip(reason)
+  if active then markDone(active.id) end
+  active, hintRef.text, tripDeadline, relaunchStop = nil, nil, nil, nil  -- cancel any pending auto-close
+  allStop(); refresh()
+  if reason then log(reason) end
+end
 
 local function startTrip(dest)
   if dest == NAME then return end
+  pruneDone()
   -- debounce accidental double-taps, but DON'T hard-lock: re-tapping re-routes
-  if active and (os.epoch("utc") - (active.ts or 0)) < 1500 then return end
+  if active and (now() - (active.ts or 0)) < 1500 then return end
   local path = pathTo(dest)
   if not path then draw("No route to " .. dest, colors.red); return end
   local rider = riderOnPad()
   if detector and not rider then draw("Step onto the pad first", colors.orange); return end
-  local now = os.epoch("utc")
-  local t = { type = "ROUTE", id = now, from = NAME, to = dest, path = path, rider = rider, ts = now }
+  local t = { type = "ROUTE", id = NAME .. ":" .. now(), from = NAME, to = dest, path = path, rider = rider, ts = now() }
   bcast(t)                                   -- tell every hop on the path to open its gate FIRST
   log("start -> " .. dest .. " via " .. table.concat(path, ">") .. (rider and (" (" .. rider .. ")") or ""))
-  active = t; hint = applyTrip(t); armTimeout(); refresh()   -- launch from our pad; junctions
-end                                                          -- catch & relaunch on their own
+  setActive(t); hintRef.text = applyTrip(t); refresh()   -- launch from our pad; junctions catch & relaunch
+end
 
 local function handle(msg)
   if type(msg) ~= "table" then return end
   if msg.type == "STATE" then
     if mergeState(msg.nodes) and not active then refresh() end
   elseif msg.type == "LS" and msg.name then            -- legacy single-node announce (transition)
-    graph[msg.name] = msg.neighbours or {}; gen[msg.name] = os.epoch("utc")
+    graph[msg.name] = msg.neighbours or {}; gen[msg.name] = now()
     if not active then refresh() end
   elseif msg.type == "LSREQ" then
     broadcastState()
   elseif msg.type == "TRIPREQ" then
     if active then bcast(active) end    -- relay an in-progress trip to a node that just (re)loaded
-  elseif msg.type == "ROUTE" and msg.path then
-    -- A node that just loaded picks the trip up here. Only fire our gate the FIRST time we
-    -- see a trip id; later re-broadcasts just keep it alive (so the origin gate, already
-    -- auto-closed, doesn't re-open and re-grab the rider).
-    local same = active and active.id == msg.id
-    active = msg; armTimeout()
-    if not same then
-      hint = applyTrip(msg); refresh()
-      if hint then log("route " .. (msg.to or "?") .. " : " .. hint) end
+  elseif msg.type == "ROUTE" and msg.path and msg.id then
+    pruneDone()
+    if done[msg.id] then return end     -- a trip we've already finished: ignore late/resurrecting beats
+    if active and active.id == msg.id then
+      active = msg                      -- same trip: keep it alive, but DON'T reset the deadline
+      return                            -- (absolute deadline) and DON'T re-fire the gate (no suck-back)
     end
+    setActive(msg)                      -- a trip we haven't seen: pick it up and open our gate
+    hintRef.text = applyTrip(msg); refresh()
+    if hintRef.text then log("route " .. (msg.to or "?") .. " : " .. hintRef.text) end
   elseif msg.type == "ARRIVED" then
-    log("arrived at " .. (msg.at or "?") .. " - trip done")
-    clearTrip()
+    markDone(msg.id)                    -- record it done even if we weren't holding it
+    if active and (msg.id == nil or active.id == msg.id) then
+      endTrip("arrived at " .. (msg.at or "?") .. " - trip done")
+    else
+      log("arrived at " .. (msg.at or "?") .. " - trip done")
+    end
   end
 end
 
 -- ---- boot ----------------------------------------------------------------
+-- NOTE: trip state is deliberately RAM-only (not persisted). A node that reloads
+-- boots with NO active trip and waits for a fresh ROUTE/beat; a still-loaded peer
+-- relays an in-progress trip to it on TRIPREQ. This avoids re-opening a gate for a
+-- trip that already finished while we were unloaded (a suck-back hazard). The
+-- network MAP is persisted (GRAPHFILE); the trip is not.
 setNameLabel()
 allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(mon ~= nil)))
+if sharedWarn then log("WARNING: >1 monitor/detector - possible shared wired network (firmware.lua diag)") end
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
                                 -- always shows current state even if this node has no modem
 if not netUp then print("[warn] no modem - this node can't see the network.") end
@@ -525,8 +791,26 @@ while true do
   local ev = e[1]
   if ev == "monitor_touch" then
     local tx, ty = e[3], e[4]
-    if rowDest[ty] then startTrip(rowDest[ty])
-    elseif navRow and ty == navRow then              -- tapped the scroll bar
+    if kbOpen then                                   -- filter keyboard: append/edit the query
+      local hit = false
+      for _, k in ipairs(kbKeys) do
+        if ty == k.y and tx >= k.x1 and tx <= k.x2 then
+          hit = true
+          if k.k == "ok" then kbOpen = false
+          elseif k.k == "del" then filter = filter:sub(1, #filter - 1)
+          elseif k.k == "clr" then filter = ""
+          elseif k.k == "spc" then filter = filter .. " "
+          else filter = filter .. k.k end
+          scroll = 0; refresh(); break
+        end
+      end
+      if not hit then kbOpen = false; refresh() end  -- tap outside any key always closes (guaranteed exit)
+    elseif btnSort and ty == btnSort.y and tx >= btnSort.x1 and tx <= btnSort.x2 then
+      sortIdx = sortIdx % #SORTS + 1; scroll = 0; refresh()   -- cycle Dist+ / Dist- / A-Z
+    elseif btnFind and ty == btnFind.y and tx >= btnFind.x1 and tx <= btnFind.x2 then
+      kbOpen = true; refresh()                                -- open the filter keyboard
+    elseif rowDest[ty] then startTrip(rowDest[ty])
+    elseif navRow and ty == navRow then                       -- tapped the scroll bar
       if tx <= (navMid or 0) then scroll = math.max(0, scroll - pageStep) else scroll = scroll + pageStep end
       refresh()
     end
@@ -544,18 +828,20 @@ while true do
         warmTimer = os.startTimer(0.5)
       end
     elseif e[2] == relaunchStop then
-      allStop()   -- close our launch exit so a bounce can't re-grab the rider; keep the trip for relay
+      relaunchStop = nil
+      if active then allStop() end   -- close our launch exit so a bounce can't re-grab the rider
     elseif e[2] == beatTimer then
       if active then bcast(active) end   -- keep relaying so nodes loading mid-route catch it
       beatTimer = os.startTimer(TRIP_BEAT)
-    elseif e[2] == tripTimer then clearTrip()
     elseif e[2] == padTimer then
-      if active and active.to == NAME and riderOnPad() then
-        -- we are the DESTINATION and the rider has landed: confirm arrival
-        bcast({ type = "ARRIVED", at = NAME, id = active.id })
-        clearTrip()
+      if active and tripDeadline and now() > tripDeadline then
+        endTrip("trip timed out - clearing")                  -- absolute deadline backstop
+      elseif active and active.to == NAME and onPad(active.rider) then
+        bcast({ type = "ARRIVED", at = NAME, id = active.id }) -- DESTINATION sees OUR rider land: confirm
+        endTrip("arrived: " .. (active.rider or "traveller"))
       elseif not active then refresh() end
-      padTimer = os.startTimer(1)
+      -- poll faster while we're the active destination so a quick rider isn't missed
+      padTimer = os.startTimer((active and active.to == NAME) and 0.4 or 1)
     end
   end
 end

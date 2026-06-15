@@ -3,22 +3,20 @@
   ===========================================================================
   Install this as `startup` on every node, ONCE. After that you never visit a
   node to change code again: it runs the node's firmware and listens on the
-  ender-modem network for pushed updates. When an update arrives it keeps THIS
-  node's own config and only swaps the code, then reboots.
+  ender-modem network for pushed updates. An update replaces the firmware CODE
+  only — this node's config lives in a SEPARATE file and is left untouched.
 
   Files on each node:
     /startup       this bootstrap
-    /firmware.lua  the node program (hypertube_node.lua spliced with this node's
-                   config between the @HT-CONFIG markers). Pushed updates replace
-                   the code around those markers but keep the config inside them.
-    /ht_group      (optional) one word; updates can target a group, or "all".
+    /firmware.lua  the node program (ht_node.lua, identical on every node)
+    /ht_node.cfg   this node's name + tube map (written by first-boot setup)
+    /ht_group      (optional) one word; updates can target a group, or "all"
 
   Push updates from any computer with an ender modem using ht_push.lua.
 --]]
 
 local PROTO = "ht_ota"
 local FW    = "/firmware.lua"
-local START_MARK, END_MARK = "@HT-CONFIG-START", "@HT-CONFIG-END"
 
 -- ---- tiny fs/util --------------------------------------------------------
 local function readAll(p)
@@ -28,51 +26,9 @@ end
 local function writeAll(p, s)
   local f = fs.open(p, "w"); f.write(s); f.close()
 end
-local function lines(s)
-  local t = {} for l in (s .. "\n"):gmatch("(.-)\n") do t[#t + 1] = l end return t
-end
 
 local GROUP = (readAll("/ht_group") or "all"):gsub("%s+", "")
 if GROUP == "" then GROUP = "all" end
-
--- ---- config-preserving splice --------------------------------------------
--- pull the text BETWEEN this node's config markers (its per-node settings)
-local function extractConfig(text)
-  local L = lines(text); local s, e
-  for i, l in ipairs(L) do
-    if not s and l:find(START_MARK, 1, true) then s = i end
-    if not e and l:find(END_MARK, 1, true) then e = i end
-  end
-  if not s or not e or s >= e then return nil end
-  local out = {} for i = s + 1, e - 1 do out[#out + 1] = L[i] end
-  return table.concat(out, "\n")
-end
-
--- put a config block into NEW firmware between its markers, keeping the markers
-local function splice(newfw, configText)
-  local L = lines(newfw); local s, e
-  for i, l in ipairs(L) do
-    if not s and l:find(START_MARK, 1, true) then s = i end
-    if not e and l:find(END_MARK, 1, true) then e = i end
-  end
-  if not s or not e or s >= e then return nil end
-  local out = {}
-  for i = 1, s do out[#out + 1] = L[i] end       -- up to & incl. START
-  out[#out + 1] = configText
-  for i = e, #L do out[#out + 1] = L[i] end        -- END onward
-  return table.concat(out, "\n")
-end
-
-local function applyUpdate(newCode)
-  local current = readAll(FW)
-  local cfg = current and extractConfig(current) or nil
-  local merged = newCode
-  if cfg then
-    local m = splice(newCode, cfg)               -- keep our config, take their code
-    if m then merged = m end
-  end
-  writeAll(FW, merged)
-end
 
 -- ---- modem ---------------------------------------------------------------
 local function openModem()
@@ -89,14 +45,16 @@ local function openModem()
 end
 
 -- ---- the two parallel jobs -----------------------------------------------
+-- An update is a whole-file replace: the firmware is identical on every node and
+-- the per-node config (/ht_node.cfg) is a separate file the update never touches.
 local function otaListener()
   while true do
     local _, msg = rednet.receive(PROTO)
     if type(msg) == "table" and msg.type == "HT_UPDATE" and type(msg.code) == "string" then
       local g = msg.group or "all"
       if g == "all" or g == GROUP then
-        print("[OTA] update received (group " .. g .. ") - keeping local config...")
-        applyUpdate(msg.code)
+        print("[OTA] update received (group " .. g .. ") - config in /ht_node.cfg is kept.")
+        writeAll(FW, msg.code)
         print("[OTA] rebooting into new firmware...")
         sleep(0.5); os.reboot()
       end
