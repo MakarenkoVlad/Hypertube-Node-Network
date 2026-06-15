@@ -28,7 +28,9 @@ local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady st
 local STALE_SEC    = 30      -- forget a node whose state we haven't refreshed in this long
 local PROTO        = "hypertube"
 local CFG          = "/ht_node.cfg"
-local BOARD_RANGE  = 2
+local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
+local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
+                             -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
 
 -- ---- peripheral discovery (by capability) --------------------------------
@@ -319,14 +321,13 @@ local function allStop() gateToward(nil) end
 
 -- ---- shared trip state ---------------------------------------------------
 local active, tripTimer = nil, nil
-local awaiting, relaunchStop = nil, nil       -- junction catch-and-relaunch: {to=nextHop, deadline}
+local relaunchStop = nil                      -- origin auto-close timer (prevents re-catching a bounce)
 local function armTimeout() tripTimer = os.startTimer(TRIP_TIMEOUT) end
 
 local function indexIn(path) for i, n in ipairs(path) do if n == NAME then return i end end end
 
 -- set this node's gate for a trip and return a human hint for our screen
 local function applyTrip(t)
-  awaiting = nil                               -- recompute fresh for the current route
   local i = indexIn(t.path)
   if not i then allStop(); return nil end      -- we're not on this path
   if i == #t.path then allStop(); return ("Arrived: %s"):format(t.rider or "traveller") end
@@ -334,50 +335,71 @@ local function applyTrip(t)
   if not controllerToward(nxt) then            -- portal hop: no tube/controller here
     allStop(); return ("Walk through the portal to %s"):format(nxt)
   end
-  if i == 1 then                               -- origin: the rider is on OUR pad - launch now
-    gateToward(nxt); return ("Board -> %s"):format(t.to)
+  gateToward(nxt)                              -- open the through-tube and KEEP it open: a 90-deg
+                                               -- junction passes the rider, and one who stops at the
+                                               -- open mouth is pulled onward too. No detector needed.
+  if i == 1 then                               -- origin: auto-close shortly after launch so a rider
+    relaunchStop = os.startTimer(RELAUNCH_HOLD) -- who bounces back can't be instantly re-grabbed
+    return ("Board -> %s"):format(t.to)
   end
-  -- intermediate junction: CATCH then RELAUNCH so the entrance angle stops mattering.
-  -- Keep the exit shut; let the rider fly in and STOP on the pad. The pad poll fires
-  -- the exit once it detects them (a stationary rider launches in any direction).
-  if detector then
-    allStop()
-    awaiting = { to = nxt, deadline = os.epoch("utc") + TRIP_TIMEOUT * 1000 }
-    return ("Catching rider -> %s"):format(t.to)
-  end
-  gateToward(nxt)                              -- no detector here: fly-through (needs 90deg build)
   return ("Pass through -> %s"):format(t.to)
 end
 
 -- ---- player presence -----------------------------------------------------
+local function firstName(players)
+  if type(players) ~= "table" then return nil end
+  local p = players[1]
+  if type(p) == "table" then return p.name end
+  return p
+end
 local function riderOnPad()
   if not detector then return nil end
-  local ok, players = pcall(detector.getPlayersInRange, BOARD_RANGE)
-  if ok and type(players) == "table" then
-    local p = players[1]
-    if type(p) == "table" then return p.name end
-    return p
+  -- Prefer a CUBOID check so the vertical reach can be taller than the horizontal one
+  -- (catches a rider who lands a block above/below the pad). Fall back to a plain range.
+  if detector.getPlayersInCubic then
+    local ok, players = pcall(detector.getPlayersInCubic, BOARD_RANGE, BOARD_HEIGHT, BOARD_RANGE)
+    if ok then return firstName(players) end
   end
+  local ok, players = pcall(detector.getPlayersInRange, math.max(BOARD_RANGE, BOARD_HEIGHT))
+  if ok then return firstName(players) end
 end
 
 -- ---- UI ------------------------------------------------------------------
 local rowDest, hint = {}, nil
+local scroll, navRow, navMid, pageStep = 0, nil, nil, 1   -- destination list scrolling
 local function draw(status, color)
   if not mon then return end
-  rowDest = {}
+  rowDest, navRow = {}, nil
   mon.setBackgroundColor(colors.black); mon.clear()
   local w, h = mon.getSize()
   mon.setBackgroundColor(colors.blue); mon.setCursorPos(1, 1); mon.clearLine()
-  mon.setTextColor(colors.white); mon.setCursorPos(2, 1); mon.write(NAME)
-  local y = 3
-  for _, node in ipairs(reachable()) do
-    mon.setCursorPos(2, y)
+  mon.setTextColor(colors.white); mon.setCursorPos(2, 1); mon.write(NAME:sub(1, w - 1))
+
+  local dests = reachable()
+  local top, bottom = 2, h - 1                       -- list rows; status sits on row h
+  local capacity = math.max(1, bottom - top + 1)
+  local paged = #dests > capacity                    -- need a nav row when the list overflows
+  pageStep = math.max(1, paged and (capacity - 1) or capacity)
+  scroll = math.max(0, math.min(scroll, math.max(0, #dests - pageStep)))
+
+  local y = top
+  for idx = scroll + 1, math.min(#dests, scroll + pageStep) do
+    local node = dests[idx]
+    mon.setCursorPos(1, y)
     mon.setBackgroundColor(active and colors.gray or colors.green)
     mon.setTextColor(colors.white)
-    local label = " " .. node
-    mon.write(label .. string.rep(" ", math.max(0, w - 2 - #label)))
-    rowDest[y] = node; rowDest[y + 1] = node
-    y = y + 2
+    mon.write(((" " .. node) .. string.rep(" ", w)):sub(1, w))
+    rowDest[y] = node
+    y = y + 1
+  end
+  if paged then                                      -- nav bar: tap left half = up, right half = down
+    navRow, navMid = bottom, math.floor(w / 2)
+    mon.setCursorPos(1, navRow)
+    mon.setBackgroundColor(scroll > 0 and colors.cyan or colors.gray); mon.setTextColor(colors.white)
+    mon.write((" ^ up" .. string.rep(" ", navMid)):sub(1, navMid))
+    mon.setBackgroundColor((scroll + pageStep) < #dests and colors.cyan or colors.gray)
+    local rw = w - navMid
+    mon.write((string.rep(" ", rw) .. "down v "):sub(-rw))
   end
   mon.setBackgroundColor(colors.black); mon.setTextColor(color or colors.lightGray)
   mon.setCursorPos(1, h); mon.write((status or "Tap a destination"):sub(1, w))
@@ -393,7 +415,7 @@ local function refresh()
 end
 
 -- ---- trips ---------------------------------------------------------------
-local function clearTrip() active, hint, awaiting = nil, nil, nil; allStop(); refresh() end
+local function clearTrip() active, hint = nil, nil; allStop(); refresh() end
 
 local function startTrip(dest)
   if dest == NAME then return end
@@ -443,8 +465,12 @@ while true do
   local e = { os.pullEvent() }
   local ev = e[1]
   if ev == "monitor_touch" then
-    local d = rowDest[e[4]]
-    if d then startTrip(d) end
+    local tx, ty = e[3], e[4]
+    if rowDest[ty] then startTrip(rowDest[ty])
+    elseif navRow and ty == navRow then              -- tapped the scroll bar
+      if tx <= (navMid or 0) then scroll = math.max(0, scroll - pageStep) else scroll = scroll + pageStep end
+      refresh()
+    end
   elseif ev == "rednet_message" then
     if e[4] == PROTO then handle(e[3]) end
   elseif ev == "timer" then
@@ -455,19 +481,16 @@ while true do
         rednet.broadcast({ type = "LSREQ" }, PROTO); broadcastState()
         warmTimer = os.startTimer(0.5)
       end
-    elseif e[2] == relaunchStop then allStop()      -- close a junction exit after the rider left
+    elseif e[2] == relaunchStop then
+      -- launch window over: close our exit so a bounce can't re-grab the rider. If we were
+      -- the origin/relay (not the final stop), free our screen back to the destination menu.
+      if active and active.to ~= NAME then clearTrip() else allStop() end
     elseif e[2] == tripTimer then clearTrip()
     elseif e[2] == padTimer then
       if active and active.to == NAME and riderOnPad() then
         -- we are the DESTINATION and the rider has landed: confirm arrival
         rednet.broadcast({ type = "ARRIVED", at = NAME, id = active.id }, PROTO)
         clearTrip()
-      elseif awaiting and riderOnPad() then
-        -- JUNCTION: the rider has landed and stopped here - NOW fire the exit toward the
-        -- next hop. Standing still, they launch whatever way the tube points (any angle).
-        gateToward(awaiting.to); relaunchStop = os.startTimer(RELAUNCH_HOLD); awaiting = nil; refresh()
-      elseif awaiting and os.epoch("utc") > awaiting.deadline then
-        awaiting = nil; allStop()                   -- rider never showed; give up and reset
       elseif not active then refresh() end
       padTimer = os.startTimer(1)
     end
