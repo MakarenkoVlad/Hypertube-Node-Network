@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v19"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v20"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -738,6 +738,19 @@ local function refresh()
   else draw() end
 end
 
+-- Force the monitor to re-initialize its render, clearing a STALE client-side frame without
+-- breaking the block. CC monitors (esp. over a wired modem, esp. on an always-loaded chunk) can
+-- get "stuck" showing an old frame; changing the text scale rebuilds the terminal and re-syncs the
+-- full state to the client. Runs at boot, so a node un-sticks its own screen after every update.
+local function pokeMonitor()
+  if not mon then return end
+  pcall(function()
+    local s = (mon.getTextScale and mon.getTextScale()) or 1
+    mon.setTextScale(s == 0.5 and 1 or 0.5)   -- a DIFFERENT scale forces a full terminal rebuild...
+    mon.setTextScale(s)                        -- ...then restore the original scale
+  end)
+end
+
 -- ---- trips ---------------------------------------------------------------
 -- end the current trip and remember its id, so a late beat can't resurrect it
 local function endTrip(reason)
@@ -804,6 +817,7 @@ allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(monName or false)))
 if #monAll > 1 then log(("note: %d monitors - drawing to %s (pin with: firmware.lua monitor)"):format(#monAll, tostring(monName))) end
 if sharedWarn then log("WARNING: >1 detector - several nodes may share one wired network (firmware.lua diag)") end
+pokeMonitor()                   -- un-stick a stale monitor frame (re-render) before drawing
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
                                 -- always shows current state even if this node has no modem
 if not netUp then print("[warn] no modem - this node can't see the network.") end
