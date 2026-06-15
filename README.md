@@ -74,14 +74,15 @@ direct hop works with no map and teaches the station the whole network, which it
 after that, multi-hop routing is reliable even when other nodes are unloaded.
 
 **Update every node — push once, it propagates.** Edit `src/ht_node.lua`, then `./push.sh`. That's it.
-Each node **auto-updates from GitHub when its chunk loads** — `ht_boot` fetches the latest firmware on
-boot and installs it if it's newer (config untouched). So as you travel the network, every node pulls
-the new build itself; you never visit nodes to update them. (Downloads are integrity-checked — a
-truncated/garbage fetch is rejected, so a dropped connection can't brick a node; drop a `/ht_pin` file
-to freeze a node on its current firmware.)
+Each node **auto-updates from GitHub** — `ht_boot` checks for a newer firmware at boot *and every few
+minutes while running*, installing it (and rebooting itself if it's running) when one appears. So
+chunk-loaded nodes update within ~5 minutes and the rest update as their chunks load; you never visit a
+node or reboot one by hand. (Downloads are integrity-checked — sentinel + compile + byte-verify — so a
+dropped/garbage fetch is rejected and can't brick a node; a node that's somehow broken self-heals; drop a
+`/ht_pin` file to freeze a node.) Auto-update is **forward-only** — to roll back, push a higher version
+containing the old code.
 
-For nodes that are **already loaded** (auto-update only fires on boot), push instantly over rednet from
-any one node:
+Want a node updated *instantly* instead of within a few minutes? Push over rednet from any one node:
 ```
 wget https://raw.githubusercontent.com/MakarenkoVlad/Hypertube-Node-Network/main/src/ht_node.lua firmware.lua
 ht_push firmware.lua

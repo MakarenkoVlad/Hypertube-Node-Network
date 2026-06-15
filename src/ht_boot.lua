@@ -5,13 +5,18 @@
   node to change code again. Two update paths, both keep this node's config
   (/ht_node.cfg) untouched - they only swap the firmware CODE:
 
-    1. AUTO-UPDATE ON BOOT (the main one): every time the chunk loads, the node
-       fetches the latest firmware from GitHub and installs it IF it's a newer
-       version. So a single `git push` propagates to every node as its chunk
-       loads - no per-node visits, no broadcasts. Drop a /ht_pin file to freeze
-       a node on its current firmware.
+    1. AUTO-UPDATE FROM GITHUB: at boot AND every UPDATE_CHECK seconds while
+       running, the node fetches the latest firmware and installs it IF it's a
+       newer version - rebooting itself when it updates while running. So a
+       single `git push` propagates to every node (chunk-loaded ones within a
+       few minutes, the rest as their chunks load) - no per-node visits, no
+       reboots by hand. Drop a /ht_pin file to freeze a node on its firmware.
     2. RENDET PUSH (instant, optional): `ht_push.lua` broadcasts to nodes that
-       are loaded RIGHT NOW (the ones auto-update won't reach until they reload).
+       are loaded RIGHT NOW.
+
+  Auto-update is FORWARD-ONLY (installs only a strictly-newer version). To roll
+  back, push a HIGHER version number that contains the old code - an ht_push of
+  an older version is reverted by the next GitHub check.
 
   Files on each node:
     /startup       this bootstrap
@@ -30,8 +35,8 @@ local function readAll(p)
   if not fs.exists(p) then return nil end
   local f = fs.open(p, "r"); local s = f.readAll(); f.close(); return s
 end
-local function writeAll(p, s)
-  local f = fs.open(p, "w"); f.write(s); f.close()
+local function writeAll(p, s)   -- returns true on success; NEVER throws (a disk error must not crash the node)
+  return pcall(function() local f = fs.open(p, "w"); f.write(s); f.close() end)
 end
 
 local GROUP = (readAll("/ht_group") or "all"):gsub("%s+", "")
@@ -59,29 +64,44 @@ local function httpGet(url, secs)
 end
 
 local SENTINEL = "@HT-NODE-EOF"   -- ht_node.lua's last line; its presence proves a COMPLETE download
+local UPDATE_CHECK = 300          -- seconds between online checks WHILE running (so a chunk-loaded node
+                                  -- updates itself with no reboot). ht_push gives an instant alternative.
 
--- Pull the latest firmware from GitHub and install it. Heavily guarded so a partial or garbage
+-- Fetch the latest firmware from GitHub and install it IF it's a valid, complete, strictly-newer build
+-- (or repairs a broken one). Returns (installed?, newVersion). Heavily guarded so a partial/garbage
 -- download can NEVER brick a node:
 --   * skipped if /ht_pin exists;
---   * the body must look like our firmware, END WITH the sentinel (so a connection dropped
---     mid-transfer is rejected - the truncated tail won't contain it), AND compile as valid Lua;
---   * installed only if strictly NEWER - OR if the CURRENT firmware is broken (won't compile),
---     which self-heals a node that somehow ended up with a corrupt firmware.
-local function autoUpdate()
-  if fs.exists("/ht_pin") then print("[auto-update] pinned - skipping."); return end
+--   * the body must look like our firmware, END WITH the sentinel (rejects a truncated transfer), AND
+--     compile as valid Lua;
+--   * the write is VERIFIED before reporting success, so a failed write can't trigger a reboot loop.
+local function tryUpdate()
+  if fs.exists("/ht_pin") then return false end
   local code = httpGet(BASE .. "src/ht_node.lua?t=" .. tostring(os.epoch("utc")), 8)  -- ?t= dodges the CDN cache
-  if type(code) ~= "string" or not code:find("HT Node", 1, true) then return end
+  if type(code) ~= "string" or not code:find("HT Node", 1, true) then return false end
   local cur = readAll(FW)
-  if code == cur then return end                              -- already running this exact firmware (cheap path)
-  if not code:find(SENTINEL, 1, true) or not load(code) then  -- truncated or invalid -> NEVER write it
-    print("[auto-update] incomplete/invalid download - keeping current firmware."); return
-  end
-  local curBroken = type(cur) ~= "string" or not load(cur)    -- installed firmware won't compile
+  if code == cur then return false end                          -- already running this exact firmware
+  if not code:find(SENTINEL, 1, true) or not load(code) then return false end   -- truncated / invalid
+  local curBroken = type(cur) ~= "string" or not load(cur)      -- installed firmware won't compile
   local newV, curV = versionOf(code), curBroken and -1 or versionOf(cur)
-  if newV > curV then
-    print(curBroken and "[auto-update] repairing broken firmware..."
-      or ("[auto-update] firmware v%d -> v%d (from GitHub)"):format(curV, newV))
-    writeAll(FW, code)
+  if newV <= curV then return false end
+  if not writeAll(FW, code) then return false end               -- write failed (disk) -> don't claim success
+  if readAll(FW) ~= code then return false end                  -- verify EXACT bytes landed (catches a truncated write)
+  return true, newV, curBroken
+end
+
+-- boot-time: install a newer firmware BEFORE running it (no reboot needed - we run the new code).
+local function autoUpdate()
+  local ok, newV, broken = tryUpdate()
+  if ok then print(broken and "[auto-update] repaired firmware." or ("[auto-update] firmware -> v%d (from GitHub)"):format(newV)) end
+end
+
+-- runtime: while the node is chunk-loaded, poll GitHub; when a newer firmware lands, install it and
+-- reboot INTO it - so an always-loaded node updates itself with NO manual reboot.
+local function autoUpdateLoop()
+  while true do
+    sleep(UPDATE_CHECK)
+    local ok, newV = tryUpdate()
+    if ok then print(("[auto-update] v%d is live - rebooting into it..."):format(newV)); sleep(0.5); os.reboot() end
   end
 end
 
@@ -109,9 +129,12 @@ local function otaListener()
       local g = msg.group or "all"
       if g == "all" or g == GROUP then
         print("[OTA] update received (group " .. g .. ") - config in /ht_node.cfg is kept.")
-        writeAll(FW, msg.code)
-        print("[OTA] rebooting into new firmware...")
-        sleep(0.5); os.reboot()
+        if writeAll(FW, msg.code) and readAll(FW) == msg.code then   -- crash-safe + verify the write landed
+          print("[OTA] rebooting into new firmware...")
+          sleep(0.5); os.reboot()
+        else
+          print("[OTA] write failed - keeping current firmware.")
+        end
       end
     end
   end
@@ -141,9 +164,11 @@ if fs.exists(FW) and not fs.exists("/ht_node.cfg") then
     sleep(1); os.reboot()
   end
 end
+-- Run the firmware alongside: the rednet OTA listener (instant pushes) and the GitHub
+-- auto-update poller (keeps a chunk-loaded node current with no manual reboot).
 if openModem() then
-  parallel.waitForAny(runFirmware, otaListener)
+  parallel.waitForAny(runFirmware, otaListener, autoUpdateLoop)
 else
-  print("[warn] no modem - running firmware only, no remote updates.")
-  runFirmware()
+  print("[warn] no modem - no rednet OTA (GitHub auto-update still on).")
+  parallel.waitForAny(runFirmware, autoUpdateLoop)
 end
