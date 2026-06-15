@@ -33,7 +33,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v11"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v12"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 
@@ -506,7 +506,7 @@ end
 -- ---- boot ----------------------------------------------------------------
 setNameLabel()
 allStop()
-log(("boot firmware %s | tubes=%d detector=%s modem=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp)))
+log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(mon ~= nil)))
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
                                 -- always shows current state even if this node has no modem
 if not netUp then print("[warn] no modem - this node can't see the network.") end
