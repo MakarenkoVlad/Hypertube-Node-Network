@@ -33,7 +33,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v10"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v11"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 
@@ -72,6 +72,12 @@ local function openModem()
     if peripheral.hasType(n, "modem") then rednet.open(n); return true end
   end
   return false
+end
+
+-- Safe broadcast: NEVER let a missing/closed modem crash the node. A node with no
+-- modem still boots, draws its screen, and runs locally - it just can't network.
+local function bcast(msg)
+  if rednet.isOpen() then pcall(rednet.broadcast, msg, PROTO) end
 end
 
 -- ---- config (name + links) ----------------------------------------------
@@ -291,7 +297,7 @@ local function broadcastState()
   saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
-  rednet.broadcast({ type = "STATE", nodes = nodes }, PROTO)
+  bcast({ type = "STATE", nodes = nodes })
 end
 
 -- merge a gossiped map; per node, keep the newer timestamp. true if anything changed.
@@ -465,7 +471,7 @@ local function startTrip(dest)
   if detector and not rider then draw("Step onto the pad first", colors.orange); return end
   local now = os.epoch("utc")
   local t = { type = "ROUTE", id = now, from = NAME, to = dest, path = path, rider = rider, ts = now }
-  rednet.broadcast(t, PROTO)                 -- tell every hop on the path to open its gate FIRST
+  bcast(t)                                   -- tell every hop on the path to open its gate FIRST
   log("start -> " .. dest .. " via " .. table.concat(path, ">") .. (rider and (" (" .. rider .. ")") or ""))
   active = t; hint = applyTrip(t); armTimeout(); refresh()   -- launch from our pad; junctions
 end                                                          -- catch & relaunch on their own
@@ -480,7 +486,7 @@ local function handle(msg)
   elseif msg.type == "LSREQ" then
     broadcastState()
   elseif msg.type == "TRIPREQ" then
-    if active then rednet.broadcast(active, PROTO) end    -- relay an in-progress trip to a node that just (re)loaded
+    if active then bcast(active) end    -- relay an in-progress trip to a node that just (re)loaded
   elseif msg.type == "ROUTE" and msg.path then
     -- A node that just loaded picks the trip up here. Only fire our gate the FIRST time we
     -- see a trip id; later re-broadcasts just keep it alive (so the origin gate, already
@@ -501,10 +507,12 @@ end
 setNameLabel()
 allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp)))
+refresh()                       -- draw the screen FIRST, before any networking, so the monitor
+                                -- always shows current state even if this node has no modem
 if not netUp then print("[warn] no modem - this node can't see the network.") end
 broadcastState()
-rednet.broadcast({ type = "LSREQ" }, PROTO)     -- ask everyone to announce
-rednet.broadcast({ type = "TRIPREQ" }, PROTO)   -- on (re)load, catch up on any trip already in progress
+bcast({ type = "LSREQ" })       -- ask everyone to announce
+bcast({ type = "TRIPREQ" })     -- on (re)load, catch up on any trip already in progress
 local lsTimer   = os.startTimer(LS_INTERVAL)
 local padTimer  = os.startTimer(1)
 local beatTimer = os.startTimer(TRIP_BEAT)
@@ -532,19 +540,19 @@ while true do
     elseif e[2] == warmTimer then
       if warm > 0 then
         warm = warm - 1
-        rednet.broadcast({ type = "LSREQ" }, PROTO); broadcastState()
+        bcast({ type = "LSREQ" }); broadcastState()
         warmTimer = os.startTimer(0.5)
       end
     elseif e[2] == relaunchStop then
       allStop()   -- close our launch exit so a bounce can't re-grab the rider; keep the trip for relay
     elseif e[2] == beatTimer then
-      if active then rednet.broadcast(active, PROTO) end   -- keep relaying so nodes loading mid-route catch it
+      if active then bcast(active) end   -- keep relaying so nodes loading mid-route catch it
       beatTimer = os.startTimer(TRIP_BEAT)
     elseif e[2] == tripTimer then clearTrip()
     elseif e[2] == padTimer then
       if active and active.to == NAME and riderOnPad() then
         -- we are the DESTINATION and the rider has landed: confirm arrival
-        rednet.broadcast({ type = "ARRIVED", at = NAME, id = active.id }, PROTO)
+        bcast({ type = "ARRIVED", at = NAME, id = active.id })
         clearTrip()
       elseif not active then refresh() end
       padTimer = os.startTimer(1)
