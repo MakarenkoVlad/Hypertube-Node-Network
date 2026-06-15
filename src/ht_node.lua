@@ -32,6 +32,8 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
+local VERSION = "v7"         -- bump on every change; shown on the monitor + printed on boot so you
+                             -- can confirm at a glance whether a node actually took the update
 
 -- ---- peripheral discovery (by capability) --------------------------------
 local function findAll(test)
@@ -373,7 +375,8 @@ local function draw(status, color)
   mon.setBackgroundColor(colors.black); mon.clear()
   local w, h = mon.getSize()
   mon.setBackgroundColor(colors.blue); mon.setCursorPos(1, 1); mon.clearLine()
-  mon.setTextColor(colors.white); mon.setCursorPos(2, 1); mon.write(NAME:sub(1, w - 1))
+  mon.setTextColor(colors.white); mon.setCursorPos(2, 1); mon.write(NAME:sub(1, w - #VERSION - 2))
+  mon.setTextColor(colors.lightGray); mon.setCursorPos(math.max(2, w - #VERSION), 1); mon.write(VERSION)
 
   local dests = reachable()
   local top, bottom = 2, h - 1                       -- list rows; status sits on row h
@@ -452,6 +455,7 @@ end
 -- ---- boot ----------------------------------------------------------------
 setNameLabel()
 allStop()
+print("HT node '" .. NAME .. "' firmware " .. VERSION)
 if not netUp then print("[warn] no modem - this node can't see the network.") end
 broadcastState()
 rednet.broadcast({ type = "LSREQ" }, PROTO)     -- ask everyone to announce
