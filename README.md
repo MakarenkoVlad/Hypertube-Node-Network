@@ -110,7 +110,8 @@ with the other node's name (on both sides). The route then carries you to the po
 |---|---|
 | `firmware.lua setup` | Re-run setup (rename / re-map tubes). |
 | `firmware.lua spin [n]` | Spin tubes one by one to identify them (step off the pad first). |
-| `firmware.lua diag` | Print this node's name, version, and every peripheral it sees (and warn about a shared wired network). |
+| `firmware.lua diag` | Print this node's name, version, peripherals, and **which monitor it's drawing to**. |
+| `firmware.lua monitor` | When the node has several monitors, pick which screen is its menu (labels each, you choose; pinned in config). |
 | `firmware.lua reset` | Wipe config + learned map, reboot into fresh setup. |
 | `firmware.lua forget` | Drop only the learned map (re-learn topology); keep name + tubes. |
 | `firmware.lua log` | Print this node's local event log. |

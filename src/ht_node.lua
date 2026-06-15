@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v17"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v18"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -86,18 +86,24 @@ local detAll = findAll(function(_, p) return p.getPlayersInRange ~= nil end)
 local monAll = findAll(function(_, p) return p.setTextScale ~= nil end)
 local detector = detAll[1] and detAll[1].wrap or nil
 
-local mon  -- largest monitor
-do
-  local best = -1
+-- Pick the monitor this node draws to: the one PINNED in config (firmware.lua monitor),
+-- else the largest found. A station can legitimately have several monitors, so we let the
+-- operator choose which screen is theirs instead of always guessing "largest" (which can
+-- flip between deploys / leave the screen you're looking at stale). Assigned after cfg loads.
+local mon, monName
+local function pickMonitor(prefName)
+  local bestW, best
   for _, m in ipairs(monAll) do
+    if prefName and m.name == prefName then return m end
     local ok, w, h = pcall(m.wrap.getSize)
-    if ok and w * h > best then best = w * h; mon = m.wrap end
+    if ok and (not bestW or w * h > bestW) then bestW = w * h; best = m end
   end
+  return best
 end
 
--- More than one monitor or detector on this computer almost always means several
--- nodes share ONE wired network and see each other's peripherals. Flag it.
-local sharedWarn = (#monAll > 1) or (#detAll > 1)
+-- Two+ DETECTORS almost always means several nodes share ONE wired network (each node has a
+-- single boarding pad). Multiple monitors is fine - pin one with `firmware.lua monitor`.
+local sharedWarn = (#detAll > 1)
 
 local function openModem()
   for _, n in ipairs(peripheral.getNames()) do
@@ -239,13 +245,14 @@ local function runSetup()
     portals[#portals + 1] = p
   end
 
-  local c = { name = name, links = links, portals = portals }
+  local c = { name = name, links = links, portals = portals, monitor = (loadCfg() or {}).monitor }
   saveCfg(c)
   print("Saved. This node is '" .. name .. "'.")
   return c
 end
 
 local cfg = loadCfg()
+do local m = pickMonitor(cfg and cfg.monitor); mon = m and m.wrap; monName = m and m.name end
 local netUp = openModem()
 if args[1] == "log" then          -- print this node's local log and exit
   if fs.exists(LOGFILE) then local f = fs.open(LOGFILE, "r"); print(f.readAll()); f.close()
@@ -260,13 +267,34 @@ if args[1] == "diag" then         -- print what this node sees; warn on a shared
     print(("  %-26s %s"):format(n, peripheral.getType(n) or "?"))
   end
   print(("controllers=%d  monitors=%d  detectors=%d  modem=%s"):format(#ctrls, #monAll, #detAll, tostring(netUp)))
+  print(("drawing to: %s %s"):format(tostring(monName or "NONE"), (cfg and cfg.monitor) and "[pinned]" or "[largest]"))
+  if #monAll > 1 then print("[note] " .. #monAll .. " monitors - if the wrong screen updates, run: firmware.lua monitor") end
   if sharedWarn then
-    print("[warn] more than one monitor/detector visible.")
-    print("       Likely a SHARED wired network: each node must be on its")
-    print("       OWN isolated wired network. The ender modem is the only")
-    print("       link that should cross between nodes.")
+    print("[warn] more than one DETECTOR visible - several nodes likely share")
+    print("       one wired network. Each node must be on its OWN isolated wired")
+    print("       network; the ender modem is the only cross-node link.")
   end
   return
+end
+if args[1] == "monitor" then      -- pick WHICH monitor this node draws to (when it has several)
+  if #monAll == 0 then print("No monitor attached to this computer."); return end
+  if #monAll == 1 then print("Only one monitor (" .. monAll[1].name .. ") - nothing to pick."); return end
+  for i, m in ipairs(monAll) do   -- label each physical screen so you can tell which is which
+    pcall(function()
+      m.wrap.setTextScale(1); m.wrap.setBackgroundColor(colors.black); m.wrap.clear()
+      m.wrap.setTextColor(colors.yellow); m.wrap.setCursorPos(2, 2); m.wrap.write("MONITOR " .. i)
+      m.wrap.setTextColor(colors.lightGray); m.wrap.setCursorPos(2, 3); m.wrap.write(m.name)
+    end)
+  end
+  print("Each monitor now shows a number. Which one is THIS")
+  print("station's screen? Enter 1.." .. #monAll .. " (Enter = cancel):")
+  write("> ")
+  local pick = tonumber(read())
+  if not pick or not monAll[pick] then print("Cancelled."); return end
+  local c = loadCfg() or {}
+  c.monitor = monAll[pick].name
+  saveCfg(c)
+  print("Pinned " .. monAll[pick].name .. ". Rebooting..."); sleep(1); os.reboot()
 end
 if args[1] == "reset" then        -- wipe name + calibration + learned map + tuning, then reboot
   for _, p in ipairs({ CFG, GRAPHFILE, TUNEFILE }) do if fs.exists(p) then fs.delete(p) end end
@@ -315,8 +343,10 @@ if args[1] == "report" then       -- write a full diagnostic snapshot to a file 
   add("[peripherals]")
   for _, n in ipairs(peripheral.getNames()) do add(("  %-28s %s"):format(n, peripheral.getType(n) or "?")) end
   local msz = "n/a"; if mon then local ok, w, h = pcall(mon.getSize); if ok then msz = w .. "x" .. h end end
-  add(("counts: controllers=%d monitors=%d detectors=%d modem(open)=%s monitor=%s"):format(#ctrls, #monAll, #detAll, tostring(netUp), msz))
-  add("shared-network warning: " .. (sharedWarn and "YES (>1 monitor/detector - isolate wired networks!)" or "no"))
+  add(("counts: controllers=%d monitors=%d detectors=%d modem(open)=%s"):format(#ctrls, #monAll, #detAll, tostring(netUp)))
+  add(("drawing to monitor: %s (%s) %s"):format(tostring(monName or "NONE"), msz, (cfg and cfg.monitor) and "[pinned]" or "[largest]"))
+  if #monAll > 1 then add("  NOTE: " .. #monAll .. " monitors present - pin yours with: firmware.lua monitor") end
+  add("shared-network warning: " .. (sharedWarn and "YES (>1 detector - several nodes likely share one wired network; isolate them)" or "no"))
   add("")
   add("[network map " .. GRAPHFILE .. "]  (node -> neighbours ; age)")
   local gf = fs.exists(GRAPHFILE) and fs.open(GRAPHFILE, "r") or nil
@@ -771,8 +801,9 @@ end
 -- network MAP is persisted (GRAPHFILE); the trip is not.
 setNameLabel()
 allStop()
-log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(mon ~= nil)))
-if sharedWarn then log("WARNING: >1 monitor/detector - possible shared wired network (firmware.lua diag)") end
+log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(monName or false)))
+if #monAll > 1 then log(("note: %d monitors - drawing to %s (pin with: firmware.lua monitor)"):format(#monAll, tostring(monName))) end
+if sharedWarn then log("WARNING: >1 detector - several nodes may share one wired network (firmware.lua diag)") end
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
                                 -- always shows current state even if this node has no modem
 if not netUp then print("[warn] no modem - this node can't see the network.") end
@@ -789,7 +820,7 @@ refresh()
 while true do
   local e = { os.pullEvent() }
   local ev = e[1]
-  if ev == "monitor_touch" then
+  if ev == "monitor_touch" and (not monName or e[2] == monName) then  -- only OUR screen's taps
     local tx, ty = e[3], e[4]
     if kbOpen then                                   -- filter keyboard: append/edit the query
       local hit = false

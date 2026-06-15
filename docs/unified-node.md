@@ -155,7 +155,8 @@ version is also on each monitor's top-right and on the boot line.
 |---|---|
 | `firmware.lua setup` | rename / re-map tubes (type on the computer, not the monitor). |
 | `firmware.lua spin [n]` | spin tubes to identify them (step off the pad — 5 s countdown). |
-| `firmware.lua diag` | print name, version, and every peripheral seen; warn on a shared wired network. |
+| `firmware.lua diag` | print name, version, peripherals, and which monitor it draws to; warn on a shared wired network. |
+| `firmware.lua monitor` | pick which screen is this node's menu when it has several monitors (pinned in config, survives OTA). |
 | `firmware.lua reset` | wipe config + learned map; reboot into fresh setup. |
 | `firmware.lua forget` | drop only the learned map (re-learn topology); keep name + tubes. |
 | `firmware.lua log` | print this node's local event log. |
