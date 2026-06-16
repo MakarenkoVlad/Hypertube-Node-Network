@@ -514,5 +514,25 @@ ok(bus.nodes["O"]:padPoll("Ren")=="shut" and (bus.nodes["O"].gates.c1 or 0)==0, 
 NOW=bus.nodes["O"].relaunchStop+1; bus.nodes["O"]:tick() -- cooldown expires
 ok(bus.nodes["O"]:padPoll("Ren")=="open" and bus.nodes["O"].gates.c1==RPM, "after the cooldown, Ren still on the pad is re-launched")
 
+print("== Phase 21: the user's real 5-hop route Avenger>Hub>Terrapin>China>Pupigo delivers to Pupigo ==")
+NOW=180000
+bus.nodes={}
+bus.nodes["Avenger"] =makeNode("Avenger", {c1="Hub"})
+bus.nodes["Hub"]     =makeNode("Hub",     {c1="Avenger",c2="Terrapin",c3="Al0p",c4="G0ldMin3"})
+bus.nodes["Terrapin"]=makeNode("Terrapin",{c1="Hub",c2="China",c3="Spawn"})
+bus.nodes["China"]   =makeNode("China",   {c1="Terrapin",c2="Pupigo"})
+bus.nodes["Pupigo"]  =makeNode("Pupigo",  {c1="China"})
+bus.nodes["Al0p"]=makeNode("Al0p",{c1="Hub"}); bus.nodes["G0ldMin3"]=makeNode("G0ldMin3",{c1="Hub"}); bus.nodes["Spawn"]=makeNode("Spawn",{c1="Terrapin"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump(); bus:pump()   -- let the map fully converge
+local p=bus.nodes["Avenger"]:startTrip("Pupigo","Vlad"); bus:pump()
+ok(p and table.concat(p,">")=="Avenger>Hub>Terrapin>China>Pupigo", "route is Avenger>Hub>Terrapin>China>Pupigo")
+-- every mid-route junction fly-throughs toward the next hop the moment it adopts the gossiped trip:
+ok(bus.nodes["Hub"].gates.c2==RPM, "Hub opened toward Terrapin")
+ok(bus.nodes["Terrapin"].gates.c2==RPM, "Terrapin opened toward China")
+ok(bus.nodes["China"].gates.c2==RPM and (bus.nodes["China"].gates.c1 or 0)==0, "China opened toward Pupigo (NOT back to Terrapin)")
+ok(bus.nodes["Pupigo"]:landPad("Vlad")==true, "Vlad lands on Pupigo -> arrival confirmed")
+bus:pump()
+ok(not anyActive(), "trip cleared end-to-end (delivered to Pupigo, not China)")
+
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end
