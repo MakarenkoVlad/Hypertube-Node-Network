@@ -31,7 +31,7 @@
     /ht_pin        (optional) if present, this node skips GitHub auto-update
 --]]
 
-local BVERSION = "b1"   -- bootstrap version; bump when ht_boot.lua changes so it self-updates like firmware
+local BVERSION = "b2"   -- bootstrap version; bump when ht_boot.lua changes so it self-updates like firmware
 local PROTO = "ht_ota"
 local FW    = "/firmware.lua"
 local BASE  = "https://raw.githubusercontent.com/MakarenkoVlad/Hypertube-Node-Network/main/"
@@ -46,8 +46,7 @@ local function writeAll(p, s)   -- returns true on success; NEVER throws (a disk
   return pcall(function() local f = fs.open(p, "w"); f.write(s); f.close() end)
 end
 
-local GROUP   -- assigned in the boot section AFTER the bootstrap self-update, so nothing that could throw
-              -- runs before tryUpdateBoot - which keeps the self-heal window maximal for future edits.
+local GROUP   -- this node's optional OTA update-group; assigned in the boot section, used by otaListener.
 
 -- ---- self-update (firmware AND this bootstrap) ---------------------------
 local SENTINEL  = "@HT-NODE-EOF"          -- ht_node.lua's last line; required in the TAIL -> COMPLETE download
@@ -100,21 +99,18 @@ end
 local function tryUpdate()     return tryUpdateFile(FW,         BASE .. "src/ht_node.lua", "HT Node", SENTINEL,  versionOf)  end
 local function tryUpdateBoot() return tryUpdateFile("/startup", BASE .. "src/ht_boot.lua", "HT Boot", BSENTINEL, bversionOf) end
 
--- boot-time firmware update: install a newer firmware BEFORE running it (no reboot needed).
-local function autoUpdate()
-  local ok, newV, broken = tryUpdate()
-  if ok then print(broken and "[auto-update] repaired firmware." or ("[auto-update] firmware -> v%d (from GitHub)"):format(newV)) end
-end
-
--- runtime: while chunk-loaded, poll for a newer BOOTSTRAP or FIRMWARE; install + reboot into it, so an
--- always-loaded node updates itself (code AND bootstrap) with NO manual reboot.
+-- Update checks run HERE, in the background under parallel - NEVER blocking boot. Their HTTP fetches can
+-- be slow or time out (8s each), but because this runs as a coroutine alongside the firmware, that delay
+-- doesn't hold up a freshly chunk-loaded node from routing (it's live in ~1s, not ~16s waiting on GitHub).
+-- First check is a few seconds after boot so updates still propagate; then every UPDATE_CHECK seconds.
 local function autoUpdateLoop()
+  sleep(3)                                   -- let the firmware boot + catch any approaching rider FIRST
   while true do
-    sleep(UPDATE_CHECK)
     local okB, didB = pcall(tryUpdateBoot)   -- pcall: a throw here must never kill the node (it's under parallel)
     if okB and didB then print("[auto-update] new bootstrap is live - rebooting..."); sleep(0.5); os.reboot() end
     local okF, didF, newV = pcall(tryUpdate)
     if okF and didF then print(("[auto-update] firmware v%d is live - rebooting..."):format(newV or 0)); sleep(0.5); os.reboot() end
+    sleep(UPDATE_CHECK)
   end
 end
 
@@ -165,15 +161,13 @@ local function runFirmware()
 end
 
 -- ---- boot ----------------------------------------------------------------
--- Self-update the BOOTSTRAP first - as the very first executable step, before GROUP or anything that
--- could throw - so even a future broken bootstrap reaches here and can pull its own fix. pcall so a
--- throw can't brick boot.
-do local ok, did = pcall(tryUpdateBoot)
-  if ok and did then print("[auto-update] bootstrap updated - rebooting..."); sleep(0.5); os.reboot() end end
+-- Start the firmware IMMEDIATELY; every GitHub update check (bootstrap AND firmware) happens in the
+-- background autoUpdateLoop under parallel. So a node that chunk-loads as a rider approaches is routing in
+-- ~1s instead of blocking ~16s on two HTTP fetches that may time out (which is what dropped riders at the
+-- hops loading just-in-time ahead of them). Updates still propagate - the loop checks a few seconds in.
 GROUP = (readAll("/ht_group") or "all"):gsub("%s+", "")
 if GROUP == "" then GROUP = "all" end
 print("HT node boot " .. BVERSION .. " (group " .. GROUP .. ").")
-pcall(autoUpdate)    -- then self-update the firmware (propagates on chunk load)
 -- First boot: run the firmware's SETUP blocking (NOT under parallel) so its
 -- on-screen typing works normally; it writes /ht_node.cfg and exits.
 if fs.exists(FW) and not fs.exists("/ht_node.cfg") then

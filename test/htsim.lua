@@ -156,6 +156,7 @@ local function makeNode(name, links, portals)
     if not t or not i then
       if self.trip and tripExpired(self.trip) then self.trip=nil; self:saveGraph() end
       if self.opened then self:allStop(); self.opened=false end
+      if who~=nil then bus:broadcast(self.NAME, { type="LSREQ" }) end  -- rider waiting, no trip -> pull it from a peer
       return "idle"
     elseif i==#t.path then                                            -- destination
       if here then self:arrive(); return "arrived" end
@@ -533,6 +534,20 @@ ok(bus.nodes["China"].gates.c2==RPM and (bus.nodes["China"].gates.c1 or 0)==0, "
 ok(bus.nodes["Pupigo"]:landPad("Vlad")==true, "Vlad lands on Pupigo -> arrival confirmed")
 bus:pump()
 ok(not anyActive(), "trip cleared end-to-end (delivered to Pupigo, not China)")
+
+print("== Phase 22: a rider waiting at a trip-less junction pulls the trip from a loaded peer (re-LSREQ recovery) ==")
+NOW=190000
+bus.nodes={}
+bus.nodes["O"]=makeNode("O",{c1="J"})
+bus.nodes["J"]=makeNode("J",{c1="O",c2="D"})
+bus.nodes["D"]=makeNode("D",{c1="J"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["O"]:startTrip("D","Sam"); bus:pump()
+bus.nodes["J"].trip=nil; bus.nodes["J"].gates={}; bus.nodes["J"].opened=false  -- J loaded late: no trip, tube shut; O still holds it
+ok(bus.nodes["J"]:live()==nil and (bus.nodes["J"].gates.c2 or 0)==0, "J has no trip and its tube is shut")
+bus.nodes["J"]:padPoll("Sam"); bus:pump()                -- Sam stands on J's pad -> J re-asks; O replies with the trip
+ok(bus.nodes["J"]:live()~=nil, "J pulled the trip from a loaded peer after the rider showed up")
+ok(bus.nodes["J"].gates.c2==RPM, "...and opened toward D so Sam is flung onward (not stranded)")
 
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end
