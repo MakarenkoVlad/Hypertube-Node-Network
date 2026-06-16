@@ -28,12 +28,12 @@ function bus:pump()
   end
 end
 
-local function makeNode(name, links, portals)
+local function makeNode(name, links, portals, bridge)
   -- The single network trip lives in SHARED state (self.trip), gossiped in STATE and persisted to disk with
   -- the map (self.files.state). Single-occupancy: newer ts supersedes; `done` monotonic; ages out at
   -- TRIP_TIMEOUT. No ROUTE/ARRIVED/TRIPREQ - a node converges on the trip from gossip or its own disk.
   local nd = { NAME=name, LINKS=links, PORTALS=portals or {}, files={}, graph={}, gen={}, trip=nil,
-               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false, riderDest={} }
+               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false, riderDest={}, bridge=bridge }
   function nd:myNeighbours()
     local s,o={},{}
     for _,nb in pairs(self.LINKS) do if not s[nb] then s[nb]=true; o[#o+1]=nb end end
@@ -73,7 +73,8 @@ local function makeNode(name, links, portals)
     if d and type(d.dests)=="table" then for nm,dd in pairs(d.dests) do if type(dd)=="table" then self.riderDest[nm]=dc(dd) end end self:pruneDests() end
   end
   function nd:broadcastState()
-    self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW; self:saveGraph(); self:pruneDests()
+    if not self.bridge then self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW end  -- a mouth advertises no row
+    self:saveGraph(); self:pruneDests()
     local nodes={} for n,nbrs in pairs(self.graph) do nodes[n]={nbrs=nbrs, ts=self.gen[n] or 0} end
     bus:broadcast(self.NAME, { type="STATE", nodes=nodes, trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest) })
   end
@@ -122,6 +123,20 @@ local function makeNode(name, links, portals)
     elseif i>1 then self:gateToward(t.path[i+1]); self.opened=true   -- JUNCTION: fly-through (open in advance)
     end
   end
+  -- ---- portal MOUTH (bridge mode): off-path relay, never a destination ----
+  -- It owns one tube flinging toward bridge.near; it spins IN ADVANCE whenever the
+  -- shared trip crosses this portal toward `near` (rider heading far->near), else shut.
+  function nd:mouthFar() return (self.bridge.near==self.bridge.a) and self.bridge.d or self.bridge.a end
+  function nd:mouthShouldSpin()
+    local t=self:live(); if not t or type(t.path)~="table" then return false end
+    local far,near=self:mouthFar(), self.bridge.near
+    for i=1,#t.path-1 do if t.path[i]==far and t.path[i+1]==near then return true end end
+    return false
+  end
+  function nd:mouthGate()
+    if self:mouthShouldSpin() then self:gateToward(self.bridge.near); self.opened=true
+    elseif self.opened then self:allStop(); self.opened=false end
+  end
   function nd:startTrip(dest, rider)
     if dest==self.NAME then return "self" end
     if self:live() and (NOW-(self.trip.ts or 0))<1.5 then return end   -- debounce; re-tap still re-routes
@@ -149,16 +164,16 @@ local function makeNode(name, links, portals)
     if type(msg)~="table" then return end
     if msg.type=="STATE" then
       local _,tc=self:mergeState(msg.nodes, msg.trip, msg.dests)
-      if tc then self:reconcile() end
+      if tc then if self.bridge then self:mouthGate() else self:reconcile() end end
     elseif msg.type=="LSREQ" then self:broadcastState() end
   end
   function nd:beat() if self:live() then self:broadcastState() end end  -- re-gossip the shared trip
   function nd:boot()
     self.loaded=true; self.graph={}; self.gen={}; self.trip=nil; self.gates={}; self.riderDest={}
     self.relaunchStop=nil; self.opened=false; self.lastHint=nil
-    self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW
+    if not self.bridge then self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW end  -- a mouth seeds no row
     self:loadGraph()                                       -- recover map AND trip from disk
-    if self:live() then self:reconcile() end               -- open a junction's onward tube immediately from disk
+    if self:live() then if self.bridge then self:mouthGate() else self:reconcile() end end  -- restore the gate from disk
     self:broadcastState()
     bus:broadcast(self.NAME, { type="LSREQ" })             -- ask for shared state (reply carries map + trip/done)
   end
@@ -589,6 +604,54 @@ bus.nodes["J"]:padPoll(nil)                             -- Mira leaves J
 for _,nd in pairs(bus.nodes) do nd.loaded=true end
 bus.nodes["D"].trip=dc(bus.nodes["J"]:live()); bus.nodes["D"]:arrive(); bus:pump()  -- she reaches D
 ok(bus.nodes["J"].riderDest["Mira"] and bus.nodes["J"].riderDest["Mira"].to==nil, "on arrival, J's remembered dest for Mira is tombstoned (won't re-launch her)")
+
+print("== Phase 24: nameless portal MOUTHS bridge A<->D - configured only with real stations, never a destination ==")
+-- physical line:  A --tube-- Bm(mouth) --portal-- Cm(mouth) --tube-- D --tube-- Z
+-- A and D just point a NORMAL tube at each other (the one network edge); the two mouths
+-- are off-path relays, each told only the two real stations it bridges + which side it flings to.
+NOW=210000
+bus.nodes={}
+bus.nodes["A"]=makeNode("A",{c1="D"})
+bus.nodes["D"]=makeNode("D",{c1="A",c2="Z"})
+bus.nodes["Z"]=makeNode("Z",{c1="D"})
+bus.nodes["Bm"]=makeNode("Bm",{m1="A"},nil,{a="A",d="D",near="A"})  -- overworld mouth: THIS side A, FAR side D, flings toward A
+bus.nodes["Cm"]=makeNode("Cm",{m1="D"},nil,{a="D",d="A",near="D"})  -- nether mouth:    THIS side D, FAR side A, flings toward D
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump(); bus:pump()
+ok(bus.nodes["A"]:pathTo("D") and table.concat(bus.nodes["A"]:pathTo("D"),">")=="A>D", "A routes to D as ONE edge (mouths are off-path)")
+local function listed(node,nm) for _,d in ipairs(dists(node)) do if d.name==nm then return true end end return false end
+ok(not listed(bus.nodes["A"],"Bm") and not listed(bus.nodes["A"],"Cm"), "neither mouth appears as a destination on A (nameless/hidden)")
+-- OUTBOUND A->D: the nether mouth (Cm) spins toward D in advance; the overworld mouth (Bm) stays shut
+bus.nodes["A"]:startTrip("D","Wade"); bus:pump()
+ok(bus.nodes["A"].gates.c1==RPM, "A (origin) flings the rider toward D / the portal")
+ok(bus.nodes["Cm"].gates.m1==RPM, "nether mouth opens its D tube IN ADVANCE (rider crossing A->D)")
+ok((bus.nodes["Bm"].gates.m1 or 0)==0, "overworld mouth stays SHUT outbound (won't re-grab the rider back toward A)")
+ok(bus.nodes["D"]:landPad("Wade")==true, "rider lands on D -> arrival confirmed")
+bus:pump()
+ok(not anyActive(), "outbound trip cleared end-to-end")
+ok((bus.nodes["Cm"].gates.m1 or 0)==0, "nether mouth closed once the trip finished (no stuck-open tube)")
+-- RETURN D->A: mirror image - overworld mouth spins toward A, nether mouth stays shut
+NOW=NOW+10
+bus.nodes["D"]:startTrip("A","Wade"); bus:pump()
+ok(bus.nodes["Bm"].gates.m1==RPM, "overworld mouth opens its A tube IN ADVANCE (rider crossing D->A)")
+ok((bus.nodes["Cm"].gates.m1 or 0)==0, "nether mouth stays SHUT on the return (no re-grab toward D)")
+ok(bus.nodes["A"]:landPad("Wade")==true, "rider lands back on A -> arrival confirmed")
+bus:pump(); ok(not anyActive(), "return trip cleared")
+-- MULTI-HOP A->Z THROUGH the portal: A->D edge then D->Z; Cm flings across the portal, D junctions onward to Z
+NOW=NOW+10
+ok(bus.nodes["A"]:pathTo("Z") and table.concat(bus.nodes["A"]:pathTo("Z"),">")=="A>D>Z", "A->Z routes A>D>Z across the portal")
+bus.nodes["A"]:startTrip("Z","Mae"); bus:pump()
+ok(bus.nodes["Cm"].gates.m1==RPM, "nether mouth flings across the portal toward D on the multi-hop trip")
+ok(bus.nodes["D"].gates.c2==RPM and (bus.nodes["D"].gates.c1 or 0)==0, "D (junction) opens onward to Z, not back to A")
+ok(bus.nodes["Z"]:landPad("Mae")==true, "rider delivered to Z through portal + junction")
+bus:pump(); ok(not anyActive(), "multi-hop portal trip cleared end-to-end")
+-- a MOUTH that reloads mid-crossing recovers the live trip from its OWN disk and re-opens (reboot-survivable)
+NOW=NOW+10
+bus.nodes["A"]:startTrip("D","Rin"); bus:pump()
+ok(bus.nodes["Cm"].gates.m1==RPM, "nether mouth open for a fresh outbound crossing")
+for _,nd in pairs(bus.nodes) do nd:unload() end                      -- the mouth cycles its chunk while everyone else is off too
+NOW=NOW+2; bus.nodes["Cm"]:boot(); bus:pump()                        -- reloads ALONE: no peer answers
+ok(bus.nodes["Cm"]:live()~=nil, "reloaded mouth recovered the live crossing from its OWN disk (no peer)")
+ok(bus.nodes["Cm"].gates.m1==RPM, "...and re-opened its tube so the crossing rider isn't stranded")
 
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end

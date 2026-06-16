@@ -98,15 +98,25 @@ The boarding menu has a control bar: **Sort** (tap to cycle nearest-first → fa
 **Find** (tap to open an on-screen keyboard and filter the list by name substring). Each stop shows its
 **hop-distance** (`direct` or `N hops`). When the list is long, a **▲/▼** bar scrolls it. Tap a stop to go.
 
-## Nether / End — portal links
+## Nether / End — portals
 
-A hypertube can't cross a dimension, so a cross-dimension (or "to the roof") hop is a **portal link**: a
-neighbour you reach by *walking through a portal* instead of riding a tube. Build a portal between the two
-spots, put a node on each side, and in setup answer the **"Portal (walk-through) to which node?"** prompt
-with the other node's name (on both sides). The route then carries you to the portal node, the screen says
-*"Walk through the portal to X,"* and the node on the far side — which already has the trip over the
-(cross-dimension) ender-modem network — resumes it. This is in the firmware today and covered by
-`test/htsim.lua` (Phase 11).
+A hypertube can't cross a dimension, so a portal is a **walk-through** in the middle of a route. Two shapes,
+depending on whether tubes meet the portal:
+
+**1. Portal mouths (tube → portal → tube).** The usual case: ride a tube to the portal, walk through, ride
+another tube onward. You **name only the two real stations** — they point a normal tube at *each other*
+(`A: tube → D`, `D: tube → A`). The computers physically at the portal are **portal mouths**: in setup answer
+**"Is this a portal mouth?"** → yes, then give it just the **two real stations it bridges** and which side its
+tube flings toward. A mouth **names itself, never appears as a destination**, and spins its tube the instant a
+trip is crossing its portal toward its side (and stays shut the other way, so a returning rider isn't grabbed
+back). Riders just pick `A` or `D`; the mouths are invisible, placed hardware. Covered by `test/htsim.lua`
+(Phase 24).
+
+**2. Walk-through neighbour (portal with no tube).** If the portal drops you straight onto the far station's
+pad (e.g. "to the roof"), there's no mouth: put a node on each side and answer the **"Portal (walk-through) to
+which node?"** prompt with the other node's name (on both sides). The route carries you to the portal node,
+the screen says *"Walk through the portal to X,"* and the far side — which already has the trip over the
+cross-dimension ender-modem network — resumes it. Covered by `test/htsim.lua` (Phase 11).
 
 ## Useful commands (on a node's computer)
 
@@ -166,6 +176,7 @@ Unified self-organizing firmware, deployed and running in-game. Routing, the dur
 **shared-state trip** — the in-flight trip is gossiped and persisted exactly like the map (merged by a
 `(ts, id)` total order with a monotonic `done` flag), so a junction that reloads mid-route recovers it
 from its own disk or any peer's gossip, **never needing a specific live peer** — are validated by
-`test/htsim.lua` (105/105). A **junction opens its tube in advance (fly-through)** so a moving rider sails
+`test/htsim.lua` (125/125). A **junction opens its tube in advance (fly-through)** so a moving rider sails
 through, while the **origin** is detector-gated (re-launches you after a reload) and the **destination**
-confirms arrival by your name. Single-occupancy (one trip at a time on the network) by design.
+confirms arrival by your name. **Cross-dimension portals** use nameless **portal mouths** that bridge two
+real stations and spin their tube only while a trip is crossing. Single-occupancy (one trip at a time) by design.

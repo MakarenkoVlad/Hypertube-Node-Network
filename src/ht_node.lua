@@ -8,7 +8,9 @@
       detector, and every Create Rotational Speed Controller);
     * first boot only: a quick on-screen SETUP — name the node, and for each
       tube you type which node it reaches. You can also add PORTAL links
-      (walk-through, e.g. Overworld<->Nether) which have no controller;
+      (walk-through, e.g. Overworld<->Nether) which have no controller; or set a
+      node up as a PORTAL MOUTH that bridges two stations across a portal — it is
+      nameless, never a destination, and just spins its tube as riders cross it;
     * shares its links over rednet (gossiped link-state); every node learns the
       whole graph and computes shortest paths itself;
     * routes any node to any node, switching at junctions; across a portal it
@@ -33,7 +35,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v31"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v32"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -213,6 +215,37 @@ local function runSetup()
     end
   end
 
+  -- PORTAL MOUTH (bridge mode): a NAMELESS node placed at a portal between two
+  -- stations. It is never a destination - you only ever name the two real stations.
+  -- It joins NO routing graph; it just watches the shared trip and spins its tube
+  -- when a rider is crossing its portal toward this side (and stays shut the other way).
+  print("")
+  write("Is this a PORTAL MOUTH? (bridges two stations across a portal) (y/N): ")
+  do
+    local yn = read()
+    if yn == "y" or yn == "Y" then
+      print("")
+      print("A portal mouth sits at a portal and flings riders out onto a tube.")
+      print("Name the TWO real stations this portal connects (NOT this mouth).")
+      local nearSt
+      while not nearSt do nearSt = askNode("Station on THIS side (where your tube delivers riders)?") end
+      local farSt
+      while not farSt do farSt = askNode("Station on the FAR side (across the portal)?") end
+      local mlinks = {}
+      for i = 1, #ctrls do mlinks[ctrls[i].name] = nearSt end  -- this mouth's tube(s) fling toward THIS side
+      if #ctrls == 0 then print("[warn] no Rotation Speed Controller here - this mouth has no tube to spin.") end
+      local autoname = "portal:" .. nearSt .. "|" .. farSt    -- hidden, auto-generated; never shown as a destination
+      local c = { name = autoname, mode = "mouth", bridge = { a = nearSt, d = farSt, near = nearSt },
+                  links = mlinks, portals = {}, monitor = (loadCfg() or {}).monitor }
+      saveCfg(c)
+      print("")
+      print("Saved as a PORTAL MOUTH: " .. nearSt .. " <-> " .. farSt)
+      print("Its tube flings riders toward " .. nearSt .. ". It won't appear as a")
+      print("destination - riders just choose " .. nearSt .. " or " .. farSt .. ".")
+      return c
+    end
+  end
+
   print("")
   print("Name this node (hub, mine, nether_hub):")
   write("> ")
@@ -263,6 +296,9 @@ end
 if args[1] == "diag" then         -- print what this node sees; warn on a shared wired network
   print(("HT node diag - firmware %s"):format(VERSION))
   print("name : " .. (cfg and cfg.name or "(unconfigured)"))
+  if cfg and cfg.mode == "mouth" and cfg.bridge then
+    print(("mode : PORTAL MOUTH  %s <-> %s  (flings -> %s)"):format(tostring(cfg.bridge.a), tostring(cfg.bridge.d), tostring(cfg.bridge.near)))
+  else print("mode : station") end
   print("peripherals:")
   for _, n in ipairs(peripheral.getNames()) do
     print(("  %-26s %s"):format(n, peripheral.getType(n) or "?"))
@@ -339,6 +375,9 @@ if args[1] == "report" then       -- write a full diagnostic snapshot to a file 
   add("")
   add("[config " .. CFG .. "]")
   add("name: " .. (cfg and cfg.name or "(UNCONFIGURED)"))
+  if cfg and cfg.mode == "mouth" and cfg.bridge then
+    add(("mode: PORTAL MOUTH  %s <-> %s  (flings -> %s)"):format(tostring(cfg.bridge.a), tostring(cfg.bridge.d), tostring(cfg.bridge.near)))
+  else add("mode: station") end
   add("tubes (controller -> neighbour):")
   if cfg and type(cfg.links) == "table" and next(cfg.links) then
     for c, nb in pairs(cfg.links) do add(("  %-30s -> %s"):format(c, nb)) end
@@ -426,6 +465,8 @@ end
 local NAME    = cfg.name
 local LINKS   = cfg.links or {}       -- controllerName -> neighbour
 local PORTALS = cfg.portals or {}     -- list of portal neighbours
+local MODE    = cfg.mode or "station" -- "station" (default) or "mouth" (a nameless portal bridge - never a destination)
+local BRIDGE  = cfg.bridge or {}      -- mouth only: { a, d, near } - the two stations it bridges + which side its tube flings toward
 
 -- log to the computer screen, a local file, and the live network log channel
 local function log(msg)
@@ -447,8 +488,10 @@ end
 -- node last refreshed itself. Nodes gossip the entire map, so ONE reply hands a
 -- newcomer the complete network at once. The timestamps make merges safe (a
 -- node's own fresh news always beats a stale gossiped copy).
-local graph = { [NAME] = myNeighbours() }    -- node -> { neighbour, ... }
-local gen   = { [NAME] = now() }             -- node -> last-refresh epoch (ms)
+-- A MOUTH contributes NO row of its own (it is not a routable destination); it only
+-- relays others' rows + the shared trip. A station seeds its own row as usual.
+local graph, gen = {}, {}
+if MODE ~= "mouth" then graph[NAME] = myNeighbours(); gen[NAME] = now() end
 
 -- The single network trip is SHARED state, exactly like the map: it rides in STATE and is saved to disk
 -- alongside the graph, so a node that reloads mid-route recovers it from its OWN disk or ANY peer's gossip -
@@ -524,7 +567,7 @@ loadGraph()   -- begin from the last-known topology AND trip, so we route (and r
 
 -- refresh our own row, then gossip the ENTIRE known map AND the current trip (the whole shared state)
 local function broadcastState()
-  graph[NAME] = myNeighbours(); gen[NAME] = now()
+  if MODE ~= "mouth" then graph[NAME] = myNeighbours(); gen[NAME] = now() end  -- a mouth never advertises itself as a node
   saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
@@ -886,6 +929,96 @@ local function handle(msg)
     broadcastState()                           -- "send me the shared state" - reply carries map AND trip
   end
 end
+
+-- ---- portal mouth (bridge mode) ------------------------------------------
+-- A MOUTH is placed at a portal between two real stations. It is NOT a routable
+-- destination and never appears in any ride menu (it advertises no graph row). It
+-- owns one tube whose entrance flings a rider OUT of the portal toward BRIDGE.near
+-- (the station on this side). It watches the single SHARED trip and spins that tube
+-- IN ADVANCE whenever the trip crosses THIS portal toward `near` (rider heading
+-- far->near) - so a rider walking through meets an already-open entrance (no sneaking)
+-- - and keeps it shut otherwise, so a rider crossing the OTHER way isn't re-grabbed.
+-- The two real stations just point a normal tube at each other (A: tube->D, D: tube->A);
+-- the mouths are transparent. The trip is the same shared state every node converges on,
+-- so a mouth recovers a live crossing from its own disk or any peer after a reload.
+local function mouthFar() return (BRIDGE.near == BRIDGE.a) and BRIDGE.d or BRIDGE.a end
+local function mouthShouldSpin()
+  local t = live(); if not t or type(t.path) ~= "table" then return false end
+  local far, near = mouthFar(), BRIDGE.near
+  for i = 1, #t.path - 1 do
+    if t.path[i] == far and t.path[i + 1] == near then return true end   -- the trip crosses our portal far->near here
+  end
+  return false
+end
+local mouthOpen = false
+local function mouthGate()
+  if mouthShouldSpin() then gateToward(BRIDGE.near); mouthOpen = true
+  elseif mouthOpen then allStop(); mouthOpen = false end
+end
+local function mouthDraw()
+  if not mon then return end
+  pcall(function()
+    local w = select(1, mon.getSize())
+    mon.setBackgroundColor(colors.black); mon.clear()
+    mon.setBackgroundColor(colors.blue); mon.setCursorPos(1, 1); mon.clearLine()
+    mon.setTextColor(colors.white);     mon.setCursorPos(2, 1); mon.write(("Portal mouth"):sub(1, math.max(1, w - #VERSION - 2)))
+    mon.setTextColor(colors.lightGray); mon.setCursorPos(math.max(2, w - #VERSION), 1); mon.write(VERSION)
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(colors.white);     mon.setCursorPos(2, 3); mon.write((tostring(BRIDGE.a) .. " <-> " .. tostring(BRIDGE.d)):sub(1, math.max(1, w - 1)))
+    mon.setTextColor(colors.lightGray); mon.setCursorPos(2, 4); mon.write(("flings out -> " .. tostring(BRIDGE.near)):sub(1, math.max(1, w - 1)))
+    mon.setTextColor(mouthOpen and colors.lime or colors.gray); mon.setCursorPos(2, 6)
+    mon.write(mouthOpen and "OPEN - walk through" or "idle")
+  end)
+end
+local function runMouth()
+  setNameLabel(); allStop()
+  loadGraph()                                   -- recover the in-flight trip from our OWN disk (reboot-survivable)
+  log(("boot MOUTH %s | %s<->%s flings->%s tubes=%d modem=%s"):format(VERSION, tostring(BRIDGE.a), tostring(BRIDGE.d), tostring(BRIDGE.near), #ctrls, tostring(netUp)))
+  if #ctrls == 0 then log("WARNING: portal mouth has no controller - no tube to spin!") end
+  mouthGate()                                   -- open immediately if a live trip is already crossing (restored from disk)
+  pokeMonitor(); mouthDraw()
+  if not netUp then print("[warn] no modem - this mouth can't hear trips.") end
+  broadcastState()                              -- relay what we know; then pull the latest shared state from peers
+  bcast({ type = "LSREQ" })
+  local lsTimer   = os.startTimer(LS_INTERVAL)
+  local gateTimer = os.startTimer(0.4)
+  local beatTimer = os.startTimer(TRIP_BEAT)
+  local warm      = 5
+  local warmTimer = os.startTimer(0.5)
+  local pokeTimer = os.startTimer(POKE_INTERVAL)   -- un-stick a stale/black monitor (if this mouth drives one)
+  while true do
+    local e = { os.pullEvent() }
+    local ev = e[1]
+    if ev == "rednet_message" then
+      if e[4] == PROTO and type(e[3]) == "table" then
+        local msg = e[3]
+        if msg.type == "STATE" then
+          local _, tripChanged = mergeState(msg.nodes, msg.trip, msg.dests)
+          if tripChanged then mouthGate(); mouthDraw() end
+        elseif msg.type == "LSREQ" then broadcastState() end
+      elseif e[4] == LOGPROTO and type(e[3]) == "table" and e[3].ping then
+        log("here - firmware " .. VERSION .. " (portal mouth)")
+      end
+    elseif ev == "timer" then
+      if e[2] == lsTimer then broadcastState(); lsTimer = os.startTimer(LS_INTERVAL)
+      elseif e[2] == gateTimer then
+        if trip and tripExpired(trip) then trip = nil; saveGraph() end   -- drop the long-finished trip from disk
+        mouthGate(); mouthDraw()
+        gateTimer = os.startTimer(live() and 0.4 or 1.5)
+      elseif e[2] == pokeTimer then
+        if mon then pokeMonitor(); mouthDraw() end
+        pokeTimer = os.startTimer(POKE_INTERVAL)
+      elseif e[2] == beatTimer then
+        if live() then broadcastState() end                              -- keep the crossing trip alive across the portal
+        beatTimer = os.startTimer(TRIP_BEAT)
+      elseif e[2] == warmTimer then
+        if warm > 0 then warm = warm - 1; bcast({ type = "LSREQ" }); broadcastState(); warmTimer = os.startTimer(0.5) end
+      end
+    end
+  end
+end
+
+if MODE == "mouth" then runMouth() end   -- a portal mouth runs its own loop and never returns; stations fall through to boot
 
 -- ---- boot ----------------------------------------------------------------
 -- The whole shared state - map AND the in-flight trip - is persisted to GRAPHFILE, so a node that reloads

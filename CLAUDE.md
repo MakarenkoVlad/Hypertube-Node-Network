@@ -22,7 +22,8 @@ loop and the distributed protocol.
 
 - **Peripheral discovery by capability** (`findAll`): the wireless modem, the monitor (largest), the
   Player Detector (`getPlayersInRange`), and every Create Rotational Speed Controller (`setTargetSpeed`).
-- **Config in `/ht_node.cfg`** — `{ name, links = { controllerName -> neighbourNodeName }, portals }`.
+- **Config in `/ht_node.cfg`** — `{ name, links = { controllerName -> neighbourNodeName }, portals }`, plus,
+  for a **portal mouth**, `{ mode = "mouth", bridge = { a, d, near } }` (see *Portal mouths* below).
   Written by on-screen `runSetup` on first boot; never touched by code updates.
 - **Gossiped link-state.** Each node holds the WHOLE topology: `graph` (node -> neighbours) + `gen`
   (per-node last-refresh epoch). Nodes broadcast their entire known map (`STATE`); one reply hands a
@@ -72,6 +73,26 @@ This is the property `test/htsim.lua` exists to protect — it models unload/rel
 that **auto-reboards a rider from memory with no live trip and no peer** (Phase 23). **Run it after any
 change to routing, the trip merge/expiry, the rider-dest logic, or the gossip logic.**
 
+### Portal mouths (bridge mode)
+
+A cross-dimension hop where the portal sits **between two tubes** (ride → walk the portal → ride) is built
+with **portal mouths**, not extra named stations. The two real stations on either side just point a normal
+tube **at each other** (`A: tube → D`, `D: tube → A`) — one undirected graph edge `A—D`; the screen and menu
+only ever show real stations. Each portal mouth (`cfg.mode == "mouth"`, `cfg.bridge = { a, d, near }`) is its
+own computer + tube placed at the portal, configured in setup with **only the two real stations it bridges**
+plus which side its tube flings toward (`near`); it auto-names itself `portal:near|far`.
+
+A mouth is **off the routed path**: it advertises **no graph row** (`broadcastState`/the top-level `graph`
+seed skip it when `MODE == "mouth"`), so it is never a routable destination and never appears in any menu. It
+runs its own loop (`runMouth`, branched to before the station boot) that watches the single SHARED trip and
+spins its tube toward `near` **in advance** iff the live trip's `path` contains the pair `(far, near)` as
+**consecutive** entries — i.e. a rider is crossing this portal in this mouth's direction — and keeps it shut
+otherwise, so a rider crossing the **other** way isn't re-grabbed. It reuses the same trip machinery
+(`adoptTrip`/`live`/`mergeState`/`saveGraph`/`loadGraph`/`gateToward`), so a mouth that reloads mid-crossing
+recovers the live trip from its own disk (Phase 24). Station logic is untouched — mouths are purely additive.
+Distinct from the older walk-through `portals` field (a tubeless "walk through to X" neighbour, Phase 11),
+which still exists for portals that drop you straight onto the far station's pad.
+
 ## Hard constraints (do not violate)
 
 - **Minecraft 1.21.1 / NeoForge.** CC: Tweaked runs natively (no Sinytra Connector needed for CC).
@@ -118,6 +139,10 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 > **The trip is shared state, not a message.** `startTrip` and arrival are just writes to `trip` that
 > gossip via `STATE`; there are **no** `ROUTE`/`ARRIVED`/`TRIPREQ` messages (a reloaded node would lose
 > them if no peer were live). Don't reintroduce point-to-point trip messages — put trip data in `STATE`.
+
+> **Portal mouths consume `STATE` but add nothing to the map.** A mouth (`MODE == "mouth"`) sends `STATE`
+> with **no row of its own** (`nodes` never contains its name) — it only relays others' rows + the trip and
+> acts on the trip locally. So it stays invisible to routing and the menu. Don't make a mouth advertise itself.
 
 > **OTA keeps config because config is a separate file.** In this unified model `/ht_node.cfg` is
 > independent of `/firmware.lua`, so an update is a whole-file replace — there are no in-firmware
@@ -173,7 +198,7 @@ push.sh                   git add/commit/push helper; prints the node update com
 
 ```bash
 luacheck src/                 # static analysis; if missing: brew install luacheck
-lua test/htsim.lua            # MUST print "105 passed, 0 failed" (or update the count with intent)
+lua test/htsim.lua            # MUST print "125 passed, 0 failed" (or update the count with intent)
 ```
 
 A no-luacheck fallback full-parse: `lua -e "assert(loadfile('src/ht_node.lua'))"`. The firmware can't

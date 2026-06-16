@@ -9,9 +9,12 @@ its peers, and routes for itself. This is the canonical reference; `README.md` i
 1. **Discovers its peripherals** by capability — the Ender modem, the monitor (largest if several),
    the Player Detector, and every Create Rotational Speed Controller (one per tube). No names typed.
 2. **First boot — on-screen setup** (saved to `/ht_node.cfg`; re-run with `firmware.lua setup`):
-   - name the node (e.g. `hub`, `mine`, `nether_hub`);
-   - for each tube, type which node it reaches (use `firmware.lua spin` first to see which tube is which);
-   - optionally add **portal links** — a neighbour reached by walking through a portal (no tube).
+   - a normal station: name the node (e.g. `hub`, `mine`, `nether_hub`); for each tube, type which node it
+     reaches (use `firmware.lua spin` first to see which tube is which); optionally add **walk-through portal
+     links** — a neighbour reached by stepping through a portal onto its pad (no tube);
+   - or a **portal mouth** (answer "Is this a portal mouth?" → yes): give only the **two real stations it
+     bridges** + which side its tube flings toward. It auto-names itself and never becomes a destination
+     (see §5a).
 3. **Gossips the topology** over rednet — every node holds the whole map and computes shortest paths
    itself. Add a node and the rest learn it automatically.
 4. **Routes any node to any node**, opening only the tube toward the next hop at each junction.
@@ -110,11 +113,41 @@ suck-back guard, and convergence behave. Run it after any change to routing or t
 
 ## 5. Cross-dimension (Nether / End)
 
-Ender modems carry rednet (and the live trip) across dimensions, but a tube can't cross a portal, so
-a cross-dimension hop is a **portal link**. The route brings you to the portal node; its screen says
-*"Walk through the portal to <node>"*; the node on the far side already has the trip from the shared
-broadcast and resumes it when its detector sees you arrive. Add a portal neighbour during setup (the
-"Portal (walk-through) to which node?" prompt); leave it blank for a normal tube-only node.
+Ender modems carry rednet (and the live trip) across dimensions, but a tube can't cross a portal. There
+are two ways to model a portal, depending on whether tubes meet it.
+
+### 5a. Portal mouths (tube → portal → tube) — bridge mode
+
+The usual cross-dimension hop: ride a tube to the portal, walk through, ride another tube onward (e.g.
+`A —tube— ▢portal▢ —tube— D` across the Overworld/Nether boundary). You **name only the two real
+stations**: `A` and `D` point a normal tube **at each other** (`A: tube → D`, `D: tube → A`), which is a
+single undirected edge `A—D` in the map — so the menu and routing only ever deal in real stations.
+
+The computers physically at the portal are **portal mouths**. In setup, answer **"Is this a portal
+mouth?"** → yes, then give it only the **two real stations it bridges** plus which side its tube flings
+riders toward (`near`). A mouth (`cfg.mode = "mouth"`, `cfg.bridge = { a, d, near }`):
+
+- **auto-names itself** `portal:near|far` and **advertises no graph row** — it is never a routable
+  destination and never appears in any ride menu;
+- runs its own loop (`runMouth`) that watches the single SHARED trip and spins its tube toward `near`
+  **in advance** exactly when the live trip's `path` has the pair `(far, near)` as **consecutive** entries
+  — i.e. a rider is crossing *this* portal in *this* mouth's direction — and keeps it shut otherwise (so a
+  rider crossing the **other** way is never re-grabbed);
+- reuses the shared-trip machinery, so a mouth that reloads mid-crossing recovers the live trip from its
+  own disk and re-opens — no peer needed.
+
+So for `A ⇄ D` you build four computers — stations `A` and `D`, and two mouths (overworld side: bridges
+`A`/`D`, flings toward `A`; nether side: bridges `A`/`D`, flings toward `D`) — and a rider just picks `A`
+or `D`. Covered end-to-end (both directions, a multi-hop `A → D → Z`, and a mid-crossing mouth reload) by
+`test/htsim.lua` Phase 24.
+
+### 5b. Walk-through neighbour (portal with no tube)
+
+If the portal drops you straight onto the far station's pad (no onward tube — e.g. "to the roof"), there's
+no mouth. The route brings you to the portal node; its screen says *"Walk through the portal to <node>"*;
+the node on the far side already has the trip from the shared broadcast and resumes it when its detector
+sees you arrive. Add a portal neighbour during setup (the **"Portal (walk-through) to which node?"**
+prompt) on **both** sides; leave it blank for a normal tube-only node.
 
 **Example — a portal to a roof base:** build a portal between your hub and the roof spot; put a node at
 each end (e.g. `hub` and `roof`); on `hub` answer the portal prompt with `roof`, and on `roof` answer it
