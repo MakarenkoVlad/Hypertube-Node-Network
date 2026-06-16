@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v29"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v30"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -472,16 +472,31 @@ local function adoptTrip(t)                   -- merge a gossiped/started trip i
   return true
 end
 
+-- A rider's DESTINATION, kept per-rider as durable shared state (gossiped + persisted, like the trip). Unlike
+-- the single transient trip, this survives a hub going ALONE: once any hub has heard "rider X is heading to
+-- Pupigo" (even for a split second during pre-load), it keeps it on disk and can RE-LAUNCH X toward Pupigo on
+-- its OWN when X drops onto its pad - no live trip and no reachable peer needed at that moment. Cleared on
+-- arrival; pruned after DEST_TTL so a missed-arrival clear can't strand a stale intent forever.
+local DEST_TTL = 300                          -- s a remembered rider->destination lives if not cleared on arrival
+local riderDest = {}                          -- name -> { to = dest, ts = epoch ms }
+local function pruneDests() local t = now(); for nm, d in pairs(riderDest) do if t - (tonumber(d.ts) or 0) > DEST_TTL * 1000 then riderDest[nm] = nil end end end
+local function mergeDest(name, d)             -- merge one gossiped rider->dest; newer ts wins (nil `to` = arrived/cleared)
+  if type(name) ~= "string" or type(d) ~= "table" then return false end
+  local cur = riderDest[name]
+  if not cur or (tonumber(d.ts) or 0) > (tonumber(cur.ts) or 0) then riderDest[name] = { to = d.to, ts = d.ts }; return true end
+  return false
+end
+
 local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComputerLabel(NAME) end end
 
 -- Durable topology. Persist the whole map so this node can route even when other
 -- nodes are unloaded (their computers are off). We do NOT forget a quiet node -
 -- quiet almost always means "chunk unloaded", not "removed" (use `forget` to drop
 -- the map deliberately). Timestamps still keep live merges correct (fresher wins).
-local function saveGraph()                    -- persist the whole shared state: map + the in-flight trip
+local function saveGraph()                    -- persist the whole shared state: map + the in-flight trip + rider dests
   pcall(function()
     local f = fs.open(GRAPHFILE, "w")
-    if f then f.write(textutils.serialize({ graph = graph, gen = gen, trip = trip })); f.close() end
+    if f then f.write(textutils.serialize({ graph = graph, gen = gen, trip = trip, dests = riderDest })); f.close() end
   end)
 end
 local function loadGraph()
@@ -498,6 +513,10 @@ local function loadGraph()
     if type(d) == "table" and type(d.trip) == "table" and not tripExpired(d.trip) then
       trip = d.trip                                        -- recover the in-flight trip we last knew (reboot-survivable)
     end
+    if type(d) == "table" and type(d.dests) == "table" then  -- recover remembered rider->destinations (reboot-survivable)
+      for nm, dd in pairs(d.dests) do if type(dd) == "table" then riderDest[nm] = dd end end
+      pruneDests()
+    end
   end)
 end
 loadGraph()   -- begin from the last-known topology AND trip, so we route (and resume) before anyone announces
@@ -508,12 +527,13 @@ local function broadcastState()
   saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
-  bcast({ type = "STATE", nodes = nodes, trip = trip })
+  pruneDests()
+  bcast({ type = "STATE", nodes = nodes, trip = trip, dests = riderDest })
 end
 
--- merge a gossiped map + trip. Returns (mapChanged, tripChanged); per node keep the newer timestamp,
--- and adoptTrip applies the single-occupancy / done-monotonic merge for the shared trip.
-local function mergeState(nodes, gtrip)
+-- merge a gossiped map + trip + rider dests. Returns (mapChanged, tripChanged); per node keep the newer
+-- timestamp, adoptTrip merges the shared trip, and mergeDest merges each remembered rider->destination.
+local function mergeState(nodes, gtrip, gdests)
   local mapChanged = false
   if type(nodes) == "table" then
     for n, info in pairs(nodes) do
@@ -524,7 +544,9 @@ local function mergeState(nodes, gtrip)
     end
   end
   local tripChanged = gtrip ~= nil and adoptTrip(gtrip)
-  if mapChanged or tripChanged then saveGraph() end
+  local destChanged = false
+  if type(gdests) == "table" then for nm, dd in pairs(gdests) do if mergeDest(nm, dd) then destChanged = true end end end
+  if mapChanged or tripChanged or destChanged then saveGraph() end
   return mapChanged, tripChanged
 end
 
@@ -815,7 +837,11 @@ local lastTripLogged = nil
 -- DESTINATION confirms arrival: flip the shared trip to done + gossip it, so the whole network (and any node
 -- that reloads later and asks for state) sees it finished and won't re-open a gate for it (no suck-back).
 local function arrive(reason)
-  if trip then trip.done = true; saveGraph(); broadcastState() end
+  if trip then
+    trip.done = true
+    if trip.rider then riderDest[trip.rider] = { to = nil, ts = math.max(now(), (tonumber(trip.ts) or 0) + 1) } end  -- tombstone (newer than the trip): rider arrived, forget their dest
+    saveGraph(); broadcastState()                                            -- gossip done + the cleared dest network-wide
+  end
   relaunchStop = nil
   if opened then allStop(); opened = false end
   reconcile(); refresh()
@@ -835,7 +861,8 @@ local function startTrip(dest)
     refresh(); return                          -- couldn't become the shared trip (shouldn't happen with a forced ts)
   end
   relaunchStop = nil; lastTripLogged = trip.id
-  saveGraph(); broadcastState()               -- publish the new trip as shared state to every node
+  riderDest[rider] = { to = dest, ts = ts }    -- remember where this rider is headed (durable, gossiped, persisted)
+  saveGraph(); broadcastState()               -- publish the new trip AND the rider's destination to every node
   log("start -> " .. dest .. " via " .. table.concat(path, ">") .. (rider and (" (" .. rider .. ")") or ""))
   gateToward(path[2]); opened = true           -- fling the rider off our pad NOW; the pad poll closes it once they leave
   hintRef.text = ("Board -> %s"):format(dest); refresh()
@@ -844,7 +871,7 @@ end
 local function handle(msg)
   if type(msg) ~= "table" then return end
   if msg.type == "STATE" then
-    local mapChanged, tripChanged = mergeState(msg.nodes, msg.trip)
+    local mapChanged, tripChanged = mergeState(msg.nodes, msg.trip, msg.dests)
     if tripChanged then
       reconcile()
       local t = live()
@@ -938,10 +965,15 @@ while true do
       if not t or not i then
         if trip and tripExpired(trip) then trip = nil; saveGraph() end  -- drop the long-finished trip from disk
         if opened then allStop(); opened = false end                    -- not on a live path -> nothing to hold open
-        if detector and onPad(nil) then bcast({ type = "LSREQ" }) end   -- a rider is standing here but we have no trip
-                                                                        -- for them yet: actively pull it from any loaded
-                                                                        -- peer (recovers a rider who arrived before we
-                                                                        -- learned the trip, e.g. we'd just chunk-loaded)
+        local who = detector and onPad(nil) or nil                      -- a rider standing here, but no live trip for them
+        if who then
+          bcast({ type = "LSREQ" })                                     -- 1) still pull a live trip from any loaded peer
+          local d = riderDest[who]                                      -- 2) AUTO-REBOARD: if we remember where they're
+          if d and d.to and d.to ~= NAME and not live() and pathTo(d.to) then  --    headed, re-launch them from HERE
+            log("auto-reboard " .. who .. " -> " .. d.to .. " (no live trip; using remembered destination)")
+            startTrip(d.to)                                             --    ourselves - no peer needed at this moment
+          end
+        end
       elseif i == #t.path then                                          -- DESTINATION: confirm when OUR rider lands
         if onPad(t.rider) then arrive("arrived: " .. (t.rider or "traveller")); arrived = true
         elseif opened then allStop(); opened = false end

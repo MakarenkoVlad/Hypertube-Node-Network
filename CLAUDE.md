@@ -59,9 +59,18 @@ from one specific live peer (the user's requirement: "peers might be offloaded")
   phantom-live/resurrected trip can hold a junction tube open until it **ages out at `TRIP_TIMEOUT`**
   (bounded, self-clearing) — accepted so riders never drop mid-route.
 
-This is the property `test/htsim.lua` exists to protect — it models unload/reload and a junction that
-**reloads alone with no peer reachable** yet recovers the trip from its own disk (Phase 14). **Run it
-after any change to routing, the trip merge/expiry, or the gossip logic.**
+- **Auto-reboard (the sparse-loading workaround).** A node also remembers each rider's DESTINATION
+  (`riderDest`, gossiped + persisted in `dests`). When a rider drops onto a hub that has **no live trip
+  and no reachable peer** — the normal case when the whole line is unloaded except where you're standing —
+  the hub **re-launches them itself** toward their remembered destination, using its own map (`startTrip`
+  from there). So the destination "follows" the rider as durable state; a hub only needs to have heard it
+  once (during a split-second pre-load) to recover a stranded rider with nobody else online. Cleared on
+  arrival (a `to=nil` tombstone) and pruned after `DEST_TTL`.
+
+This is the property `test/htsim.lua` exists to protect — it models unload/reload, a junction that
+**reloads alone with no peer reachable** yet recovers the trip from its own disk (Phase 14), and a hub
+that **auto-reboards a rider from memory with no live trip and no peer** (Phase 23). **Run it after any
+change to routing, the trip merge/expiry, the rider-dest logic, or the gossip logic.**
 
 ## Hard constraints (do not violate)
 
@@ -101,7 +110,7 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 
 | Type | Sent by | Meaning |
 |---|---|---|
-| `STATE{ nodes, trip }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }` AND the single `trip` (`{id,from,to,path,rider,ts,done}` or nil). Receiver merges the map (fresher ts wins) and the trip (`adoptTrip`: (ts,id) order, `done` monotonic). |
+| `STATE{ nodes, trip, dests }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }`, the single `trip` (`{id,from,to,path,rider,ts,done}` or nil), AND `dests` (`name -> { to, ts }`, each rider's remembered destination). Receiver merges the map (fresher ts wins), the trip (`adoptTrip`: (ts,id) order, `done` monotonic), and dests (`mergeDest`: newer ts wins; `to=nil` is an arrival tombstone). |
 | `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
 | `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA firmware push; `ht_boot` swaps `/firmware.lua` and reboots. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / every node's `log` | version ping / live log line. |
@@ -164,7 +173,7 @@ push.sh                   git add/commit/push helper; prints the node update com
 
 ```bash
 luacheck src/                 # static analysis; if missing: brew install luacheck
-lua test/htsim.lua            # MUST print "91 passed, 0 failed" (or update the count with intent)
+lua test/htsim.lua            # MUST print "105 passed, 0 failed" (or update the count with intent)
 ```
 
 A no-luacheck fallback full-parse: `lua -e "assert(loadfile('src/ht_node.lua'))"`. The firmware can't

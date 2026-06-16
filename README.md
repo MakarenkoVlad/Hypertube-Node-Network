@@ -166,6 +166,6 @@ Unified self-organizing firmware, deployed and running in-game. Routing, the dur
 **shared-state trip** — the in-flight trip is gossiped and persisted exactly like the map (merged by a
 `(ts, id)` total order with a monotonic `done` flag), so a junction that reloads mid-route recovers it
 from its own disk or any peer's gossip, **never needing a specific live peer** — are validated by
-`test/htsim.lua` (91/91). A **junction opens its tube in advance (fly-through)** so a moving rider sails
+`test/htsim.lua` (105/105). A **junction opens its tube in advance (fly-through)** so a moving rider sails
 through, while the **origin** is detector-gated (re-launches you after a reload) and the **destination**
 confirms arrival by your name. Single-occupancy (one trip at a time on the network) by design.

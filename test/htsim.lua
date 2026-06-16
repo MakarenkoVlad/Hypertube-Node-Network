@@ -9,6 +9,7 @@
 local RPM = 128
 local TRIP_TIMEOUT = 30
 local RELAUNCH_HOLD = 3        -- matches the firmware tunable (launch cooldown)
+local DEST_TTL = 300          -- matches the firmware: how long a remembered rider->dest lives
 local NOW = 1000
 local function dc(t) if type(t)~="table" then return t end local r={} for k,v in pairs(t) do r[k]=dc(v) end return r end
 local function tripExpired(t) return (not t) or (NOW-(tonumber(t.ts) or 0))>TRIP_TIMEOUT end
@@ -32,7 +33,7 @@ local function makeNode(name, links, portals)
   -- the map (self.files.state). Single-occupancy: newer ts supersedes; `done` monotonic; ages out at
   -- TRIP_TIMEOUT. No ROUTE/ARRIVED/TRIPREQ - a node converges on the trip from gossip or its own disk.
   local nd = { NAME=name, LINKS=links, PORTALS=portals or {}, files={}, graph={}, gen={}, trip=nil,
-               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false }
+               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false, riderDest={} }
   function nd:myNeighbours()
     local s,o={},{}
     for _,nb in pairs(self.LINKS) do if not s[nb] then s[nb]=true; o[#o+1]=nb end end
@@ -54,28 +55,38 @@ local function makeNode(name, links, portals)
     end
     return true
   end
+  function nd:pruneDests() for nm,d in pairs(self.riderDest) do if NOW-(tonumber(d.ts) or 0)>DEST_TTL then self.riderDest[nm]=nil end end end
+  function nd:mergeDest(rn, d)  -- merge one gossiped rider->dest; newer ts wins
+    if type(rn)~="string" or type(d)~="table" then return false end
+    local cur=self.riderDest[rn]
+    if not cur or (tonumber(d.ts) or 0)>(tonumber(cur.ts) or 0) then self.riderDest[rn]={to=d.to, ts=d.ts}; return true end
+    return false
+  end
   -- ---- shared state persist + gossip ----
-  function nd:saveGraph() self.files.state={ graph=dc(self.graph), gen=dc(self.gen), trip=self.trip and dc(self.trip) or nil } end
+  function nd:saveGraph() self.files.state={ graph=dc(self.graph), gen=dc(self.gen), trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest) } end
   function nd:loadGraph()
     local d=self.files.state
     if d and d.graph then for n,nbrs in pairs(d.graph) do
       if n~=self.NAME then self.graph[n]=dc(nbrs); self.gen[n]=(d.gen and d.gen[n]) or 0 end
     end end
     if d and type(d.trip)=="table" and not tripExpired(d.trip) then self.trip=dc(d.trip) end
+    if d and type(d.dests)=="table" then for nm,dd in pairs(d.dests) do if type(dd)=="table" then self.riderDest[nm]=dc(dd) end end self:pruneDests() end
   end
   function nd:broadcastState()
-    self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW; self:saveGraph()
+    self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW; self:saveGraph(); self:pruneDests()
     local nodes={} for n,nbrs in pairs(self.graph) do nodes[n]={nbrs=nbrs, ts=self.gen[n] or 0} end
-    bus:broadcast(self.NAME, { type="STATE", nodes=nodes, trip=self.trip and dc(self.trip) or nil })
+    bus:broadcast(self.NAME, { type="STATE", nodes=nodes, trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest) })
   end
-  function nd:mergeState(nodes, gtrip)
+  function nd:mergeState(nodes, gtrip, gdests)
     local mc=false
     if type(nodes)=="table" then for n,info in pairs(nodes) do if type(info)=="table" and type(info.nbrs)=="table" then
       local ts=info.ts or 0
       if not self.gen[n] or ts>self.gen[n] then self.graph[n]=dc(info.nbrs); self.gen[n]=ts; mc=true end
     end end end
     local tc = gtrip~=nil and self:adoptTrip(gtrip)
-    if mc or tc then self:saveGraph() end
+    local dch=false
+    if type(gdests)=="table" then for nm,dd in pairs(gdests) do if self:mergeDest(nm,dd) then dch=true end end end
+    if mc or tc or dch then self:saveGraph() end
     return mc, tc
   end
   function nd:pathTo(dest)
@@ -119,12 +130,17 @@ local function makeNode(name, links, portals)
     local ts=math.max(NOW, (self.trip and tonumber(self.trip.ts) or 0)+1)  -- strictly newer so adoptTrip can't reject
     if not self:adoptTrip({ id=self.NAME..":"..self.tripSeq, from=self.NAME, to=dest, path=path, rider=rider, ts=ts, done=false }) then return nil end
     self.relaunchStop=nil; self.lastHint="Board->"..dest
-    self:saveGraph(); self:broadcastState()                -- publish the new trip as shared state
+    if rider then self.riderDest[rider]={to=dest, ts=ts} end  -- remember where this rider is headed (durable)
+    self:saveGraph(); self:broadcastState()                -- publish the new trip + dest as shared state
     self:gateToward(path[2]); self.opened=true             -- fling off our pad; the pad poll closes it when they leave
     return path
   end
   function nd:arrive()                                     -- DESTINATION: flip the shared trip to done + gossip
-    if self.trip then self.trip.done=true; self:saveGraph(); self:broadcastState() end
+    if self.trip then
+      self.trip.done=true
+      if self.trip.rider then self.riderDest[self.trip.rider]={to=nil, ts=math.max(NOW,(tonumber(self.trip.ts) or 0)+1)} end  -- tombstone (newer than trip)
+      self:saveGraph(); self:broadcastState()
+    end
     self.relaunchStop=nil
     if self.opened then self:allStop(); self.opened=false end
     self:reconcile()
@@ -132,13 +148,13 @@ local function makeNode(name, links, portals)
   function nd:handle(msg)
     if type(msg)~="table" then return end
     if msg.type=="STATE" then
-      local _,tc=self:mergeState(msg.nodes, msg.trip)
+      local _,tc=self:mergeState(msg.nodes, msg.trip, msg.dests)
       if tc then self:reconcile() end
     elseif msg.type=="LSREQ" then self:broadcastState() end
   end
   function nd:beat() if self:live() then self:broadcastState() end end  -- re-gossip the shared trip
   function nd:boot()
-    self.loaded=true; self.graph={}; self.gen={}; self.trip=nil; self.gates={}
+    self.loaded=true; self.graph={}; self.gen={}; self.trip=nil; self.gates={}; self.riderDest={}
     self.relaunchStop=nil; self.opened=false; self.lastHint=nil
     self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW
     self:loadGraph()                                       -- recover map AND trip from disk
@@ -156,7 +172,11 @@ local function makeNode(name, links, portals)
     if not t or not i then
       if self.trip and tripExpired(self.trip) then self.trip=nil; self:saveGraph() end
       if self.opened then self:allStop(); self.opened=false end
-      if who~=nil then bus:broadcast(self.NAME, { type="LSREQ" }) end  -- rider waiting, no trip -> pull it from a peer
+      if who~=nil then
+        bus:broadcast(self.NAME, { type="LSREQ" })                     -- 1) pull a live trip from any loaded peer
+        local d=self.riderDest[who]                                    -- 2) AUTO-REBOARD from our remembered destination
+        if d and d.to and d.to~=self.NAME and not self:live() and self:pathTo(d.to) then self:startTrip(d.to, who) end
+      end
       return "idle"
     elseif i==#t.path then                                            -- destination
       if here then self:arrive(); return "arrived" end
@@ -548,6 +568,27 @@ ok(bus.nodes["J"]:live()==nil and (bus.nodes["J"].gates.c2 or 0)==0, "J has no t
 bus.nodes["J"]:padPoll("Sam"); bus:pump()                -- Sam stands on J's pad -> J re-asks; O replies with the trip
 ok(bus.nodes["J"]:live()~=nil, "J pulled the trip from a loaded peer after the rider showed up")
 ok(bus.nodes["J"].gates.c2==RPM, "...and opened toward D so Sam is flung onward (not stranded)")
+
+print("== Phase 23: a hub that REMEMBERS a rider's destination auto-reboards them, with NO live trip and NO peer ==")
+NOW=200000
+bus.nodes={}
+bus.nodes["O"]=makeNode("O",{c1="J"})
+bus.nodes["J"]=makeNode("J",{c1="O",c2="D"})
+bus.nodes["D"]=makeNode("D",{c1="J"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["O"]:startTrip("D","Mira"); bus:pump()         -- O publishes the trip AND riderDest[Mira]=D; J hears it once
+ok(bus.nodes["J"].riderDest["Mira"] and bus.nodes["J"].riderDest["Mira"].to=="D", "J learned Mira's destination from the gossip")
+bus.nodes["J"].trip=nil; bus.nodes["J"].gates={}; bus.nodes["J"].opened=false  -- J's live trip is gone (it cycled)
+for n,nd in pairs(bus.nodes) do if n~="J" then nd:unload() end end             -- and EVERY other node unloads (no peer)
+ok(bus.nodes["J"]:live()==nil and (bus.nodes["J"].gates.c2 or 0)==0, "J has no live trip and its tube is shut, completely alone")
+bus.nodes["J"]:padPoll("Mira")                          -- Mira drops onto J's pad; J re-launches her from MEMORY
+ok(bus.nodes["J"]:live()~=nil and bus.nodes["J"]:live().to=="D", "J AUTO-REBOARDED Mira toward D from its remembered destination")
+ok(bus.nodes["J"].gates.c2==RPM, "...and opened toward D -> Mira flung onward, no peer needed at that moment")
+-- arrival tombstones the dest so a later step onto a hub doesn't re-launch her:
+bus.nodes["J"]:padPoll(nil)                             -- Mira leaves J
+for _,nd in pairs(bus.nodes) do nd.loaded=true end
+bus.nodes["D"].trip=dc(bus.nodes["J"]:live()); bus.nodes["D"]:arrive(); bus:pump()  -- she reaches D
+ok(bus.nodes["J"].riderDest["Mira"] and bus.nodes["J"].riderDest["Mira"].to==nil, "on arrival, J's remembered dest for Mira is tombstoned (won't re-launch her)")
 
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end
