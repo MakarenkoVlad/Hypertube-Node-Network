@@ -131,9 +131,9 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 
 | Type | Sent by | Meaning |
 |---|---|---|
-| `STATE{ nodes, trip, dests, tombs }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }`, the single `trip` (`{id,from,to,path,rider,ts,done}` or nil), `dests` (`name -> { to, ts }`, each rider's remembered destination), AND `tombs` (`name -> removalTs`, node-removal tombstones). Receiver merges the map (fresher ts wins), the trip (`adoptTrip`: (ts,id) order, `done` monotonic), dests (`mergeDest`: newer ts wins; `to=nil` is an arrival tombstone), and tombs (`mergeTomb`: newer removalTs wins, never self). A tomb suppresses any row for that name with `ts <= removalTs`; a row with `ts > removalTs` un-removes the node. |
+| `STATE{ nodes, trip, dests, tombs, ver }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }`, the single `trip` (`{id,from,to,path,rider,ts,done}` or nil), `dests` (`name -> { to, ts }`, each rider's remembered destination), `tombs` (`name -> removalTs`, node-removal tombstones), AND `ver` (this node's firmware version, for peer auto-propagation). Receiver merges the map (fresher ts wins), the trip (`adoptTrip`: (ts,id) order, `done` monotonic), dests (`mergeDest`: newer ts wins; `to=nil` is an arrival tombstone), and tombs (`mergeTomb`: newer removalTs wins, never self). A tomb suppresses any row for that name with `ts <= removalTs`; a row with `ts > removalTs` un-removes the node. |
 | `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
-| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA firmware push; `ht_boot` swaps `/firmware.lua` and reboots. |
+| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push`; **any node, to an OLDER peer** (auto-propagation) | OTA firmware push; `ht_boot` swaps `/firmware.lua` and reboots. A running node sends its own firmware to peers advertising a lower `ver` (forward-only), so one seed spreads network-wide. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / every node's `log` | version ping / live log line. |
 
 > **The trip is shared state, not a message.** `startTrip` and arrival are just writes to `trip` that
@@ -151,6 +151,16 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 > (Phase 25). It self-heals: a node that's actually alive re-gossips a row with `ts > removalTs` and
 > un-tombstones itself, so `forget` can't permanently kill a live node. `firmware.lua forget` with NO name keeps
 > its old meaning (drop this node's learned map and re-learn). Tombs prune after `TOMB_TTL` (30 days).
+
+> **Firmware auto-propagates peer-to-peer.** Every node advertises its `ver` (in `STATE` and on the log
+> channel). A running node that hears a peer on a STRICTLY older version sends that peer its OWN running
+> firmware over `ht_ota` — the same message `ht_push` sends, which every node's `ht_boot` already applies and
+> reboots into. So one seed (a single `ht_push`, or one node's GitHub auto-update) spreads to every node as its
+> chunk loads — no GitHub dependency, no per-node visit. It's **forward-only** (push only to older peers → no
+> downgrade/ping-pong), **throttled** per peer (`PROPAGATE_COOLDOWN`), **deferred while a trip is live** (never
+> reboot a junction mid-route), and only ever spreads a firmware that is **running + compiles here** (a broken
+> build can't propagate). `propagateTo`/`noteVer`/`flushStale` in the firmware; the receive side is the existing
+> `ht_boot` OTA listener, so it even updates nodes still on an old firmware.
 
 > **OTA keeps config because config is a separate file.** In this unified model `/ht_node.cfg` is
 > independent of `/firmware.lua`, so an update is a whole-file replace — there are no in-firmware
@@ -206,7 +216,7 @@ push.sh                   git add/commit/push helper; prints the node update com
 
 ```bash
 luacheck src/                 # static analysis; if missing: brew install luacheck
-lua test/htsim.lua            # MUST print "133 passed, 0 failed" (or update the count with intent)
+lua test/htsim.lua            # MUST print "139 passed, 0 failed" (or update the count with intent)
 ```
 
 A no-luacheck fallback full-parse: `lua -e "assert(loadfile('src/ht_node.lua'))"`. The firmware can't

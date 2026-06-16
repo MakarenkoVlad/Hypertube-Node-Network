@@ -88,6 +88,13 @@ wget https://raw.githubusercontent.com/MakarenkoVlad/Hypertube-Node-Network/main
 ht_push firmware.lua
 ```
 
+**Nodes also propagate firmware to each other.** A running node that hears a peer on an older version sends it
+its own (running, compiling) firmware over rednet — the same channel `ht_push` uses, which every node's
+bootstrap already applies. So you don't have to reach every node: **one seed** (a single `ht_push`, or just one
+node updating from GitHub) spreads to the whole network as chunks load — even nodes still on an old build, and
+with no GitHub dependency. It's forward-only (never downgrades), throttled, and pauses while a trip is in flight
+(so it never reboots a junction mid-route).
+
 **Track the rollout.** Run `htlog` and press **V** (or `htlog versions`): every loaded node prints its
 firmware version, and any on an older build is flagged — load the chunks (travel the line) so they
 auto-update, until the census is all-green on the newest version.
@@ -177,7 +184,7 @@ Unified self-organizing firmware, deployed and running in-game. Routing, the dur
 **shared-state trip** — the in-flight trip is gossiped and persisted exactly like the map (merged by a
 `(ts, id)` total order with a monotonic `done` flag), so a junction that reloads mid-route recovers it
 from its own disk or any peer's gossip, **never needing a specific live peer** — are validated by
-`test/htsim.lua` (133/133). A **junction opens its tube in advance (fly-through)** so a moving rider sails
+`test/htsim.lua` (139/139). A **junction opens its tube in advance (fly-through)** so a moving rider sails
 through, while the **origin** is detector-gated (re-launches you after a reload) and the **destination**
 confirms arrival by your name. **Cross-dimension portals** use nameless **portal mouths** that bridge two
 real stations and spin their tube only while a trip is crossing. Single-occupancy (one trip at a time) by design.

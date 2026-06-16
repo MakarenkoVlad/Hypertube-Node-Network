@@ -165,7 +165,7 @@ Messages are typed tables; receivers filter by protocol and guard on shape.
 |---|---|---|
 | `STATE{ nodes, trip }` | boot, heartbeat, beat, on `LSREQ` | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }` **and** the single `trip` (`{id,from,to,path,rider,ts,done}` or nil). Receiver merges the map (fresher ts wins) and the trip (`adoptTrip`: (ts,id) order, `done` monotonic). |
 | `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
-| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA push; `ht_boot` replaces `/firmware.lua` and reboots. |
+| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push`; any node to an OLDER peer (auto-propagation) | OTA push; `ht_boot` replaces `/firmware.lua` and reboots. A node sends its own firmware to peers advertising a lower `ver` (forward-only), so one seed spreads network-wide as chunks load. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / each node's `log` | version ping / live log line. |
 
 **OTA preserves config because config is a separate file.** `/ht_node.cfg` is independent of

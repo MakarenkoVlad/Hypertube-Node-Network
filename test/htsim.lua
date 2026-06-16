@@ -704,5 +704,15 @@ ok(not hasNode(bus.nodes["Hub"],"B"), "removing a still-alive node B momentarily
 NOW=NOW+1; bus.nodes["B"]:broadcastState(); bus:pump()
 ok(hasNode(bus.nodes["Hub"],"B") and bus.nodes["Hub"].tombs["B"]==nil, "live node B re-gossips a fresher row -> un-tombstoned everywhere (forget can't kill a live node)")
 
+print("== Phase 26: firmware auto-propagation is forward-only (never downgrade, never re-push a current peer) ==")
+local function verNum(v) return tonumber(tostring(v):match("v(%d+)")) or 0 end
+local function shouldPush(myVer, peerVer) return verNum(peerVer) < verNum(myVer) end  -- mirror of firmware propagateTo gate
+ok(shouldPush("v34","v28")==true, "a v34 node pushes to a v28 peer (older -> update)")
+ok(shouldPush("v34","v33")==true, "a v34 node pushes to a v33 peer (one behind)")
+ok(shouldPush("v34","v34")==false, "a v34 node does NOT push to another v34 peer (no same-version reboot storm)")
+ok(shouldPush("v33","v34")==false, "a v33 node does NOT push to a v34 peer (forward-only -> no downgrade/ping-pong)")
+ok(verNum("v9")<verNum("v33"), "version compare is NUMERIC (v9 < v33, not lexical)")
+ok(verNum("garbage")==0 and shouldPush("v34","garbage")==true, "an unparseable peer version reads as 0 -> gets updated")
+
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end

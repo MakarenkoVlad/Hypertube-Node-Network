@@ -28,14 +28,16 @@ local TRIP_BEAT     = 2      -- s: re-broadcast the active trip so a node that j
 local RELAUNCH_HOLD = 3      -- s cooldown after a rider leaves our pad before we'd re-open the SAME trip's tube (anti-bounce)
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
 local POKE_INTERVAL = 8     -- s between idle monitor re-renders (un-stick a black/stale client frame)
+local PROPAGATE_COOLDOWN = 30  -- s min between firmware pushes to the SAME older peer (auto-rollout throttle)
 local GRAPHFILE    = "/ht_graph.dat"  -- durable copy of the network map (survives reboot / chunk unload)
 local PROTO        = "hypertube"
+local OTAPROTO     = "ht_ota"  -- firmware-push channel the bootstrap (ht_boot) listens on; used for peer auto-propagation
 local CFG          = "/ht_node.cfg"
 local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v33"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v34"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -72,6 +74,17 @@ end
 
 local function now() return os.epoch("utc") end
 local function trim(s) return s and (s:gsub("^%s+", ""):gsub("%s+$", "")) or s end
+
+-- firmware version as a number (v34 -> 34) for forward-only comparison during peer auto-propagation
+local function verNum(v) return tonumber(tostring(v):match("v(%d+)")) or 0 end
+local MYVER = verNum(VERSION)
+local OTA_GROUP = "all"          -- this node's update group (for directed firmware pushes); /ht_group overrides
+do
+  if fs.exists("/ht_group") then
+    local f = fs.open("/ht_group", "r")
+    if f then local g = (f.readAll() or ""):gsub("%s+", ""); f.close(); if g ~= "" then OTA_GROUP = g end end
+  end
+end
 
 -- ---- peripheral discovery (by capability) --------------------------------
 local function findAll(test)
@@ -617,8 +630,38 @@ local function broadcastState()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
   pruneDests()
-  bcast({ type = "STATE", nodes = nodes, trip = trip, dests = riderDest, tombs = tombs })
+  bcast({ type = "STATE", nodes = nodes, trip = trip, dests = riderDest, tombs = tombs, ver = VERSION })
 end
+
+-- ---- firmware auto-propagation (peer-to-peer rollout) ---------------------
+-- Rolling a new firmware out by hand (wget per node) is the chore we avoid. Every node advertises its VERSION
+-- (in STATE and on the log channel); when we hear a peer running an OLDER version we send it OUR OWN running
+-- firmware over ht_ota - the exact channel ht_push uses, which every node's bootstrap already applies and reboots
+-- into. So ONE seed (a single ht_push, or one node's GitHub auto-update) spreads to every node as its chunk
+-- loads, with NO GitHub dependency and no per-node visit. Forward-only (we push only to STRICTLY older peers, so
+-- no downgrade or ping-pong), throttled per peer, and deferred while a trip is live (don't reboot a junction
+-- mid-route). We only ever spread a firmware that is RUNNING here and compiles, so a broken build can't propagate.
+local pushCooldown = {}                         -- peer computer id -> earliest next push (epoch ms)
+local stalePeers   = {}                         -- peer computer id -> its (older) version string, pending a push
+local function propagateTo(peerId)
+  local pv = stalePeers[peerId]
+  if type(peerId) ~= "number" or not pv or verNum(pv) >= MYVER then stalePeers[peerId] = nil; return end
+  if live() then return end                     -- never reboot a peer mid-trip; the LS timer retries when idle
+  if pushCooldown[peerId] and now() < pushCooldown[peerId] then return end
+  local code
+  pcall(function() if fs.exists("/firmware.lua") then local f = fs.open("/firmware.lua", "r"); code = f.readAll(); f.close() end end)
+  if type(code) ~= "string" or not code:sub(-256):find("@HT-NODE-EOF", 1, true) or not load(code) then return end  -- only spread a COMPLETE, compiling firmware
+  pushCooldown[peerId] = now() + PROPAGATE_COOLDOWN * 1000
+  pcall(rednet.send, peerId, { type = "HT_UPDATE", group = OTA_GROUP, code = code }, OTAPROTO)
+  log(("auto-update: pushed firmware %s to an older peer (was %s)"):format(VERSION, tostring(pv)))
+end
+local function noteVer(peerId, peerVer)         -- record a peer's advertised version; push immediately if we're idle
+  if type(peerId) ~= "number" or type(peerVer) ~= "string" then return end
+  if verNum(peerVer) >= MYVER then stalePeers[peerId] = nil; return end  -- current/newer peer: nothing to do
+  stalePeers[peerId] = peerVer
+  propagateTo(peerId)
+end
+local function flushStale() for id in pairs(stalePeers) do propagateTo(id) end end   -- retry pending pushes (called when idle)
 
 -- merge a gossiped map + trip + rider dests + removal tombstones. Returns (mapChanged, tripChanged); per node
 -- keep the newer timestamp, adoptTrip merges the shared trip, mergeDest merges each rider->destination, and a
@@ -1043,6 +1086,7 @@ local function runMouth()
     local e = { os.pullEvent() }
     local ev = e[1]
     if ev == "rednet_message" then
+      if type(e[3]) == "table" and e[3].ver then noteVer(e[2], e[3].ver) end  -- auto-propagate firmware to older peers
       if e[4] == PROTO and type(e[3]) == "table" then
         local msg = e[3]
         if msg.type == "STATE" then
@@ -1053,7 +1097,7 @@ local function runMouth()
         log("here - firmware " .. VERSION .. " (portal mouth)")
       end
     elseif ev == "timer" then
-      if e[2] == lsTimer then broadcastState(); lsTimer = os.startTimer(LS_INTERVAL)
+      if e[2] == lsTimer then broadcastState(); if not live() then flushStale() end; lsTimer = os.startTimer(LS_INTERVAL)
       elseif e[2] == gateTimer then
         if trip and tripExpired(trip) then trip = nil; saveGraph() end   -- drop the long-finished trip from disk
         mouthGate(); mouthDraw()
@@ -1129,12 +1173,13 @@ while true do
       refresh()
     end
   elseif ev == "rednet_message" then
+    if type(e[3]) == "table" and e[3].ver then noteVer(e[2], e[3].ver) end  -- peer advertised a version -> auto-propagate if it's older
     if e[4] == PROTO then handle(e[3])
     elseif e[4] == LOGPROTO and type(e[3]) == "table" and e[3].ping then
       log("here - firmware " .. VERSION)       -- viewer asked who's online; report version
     end
   elseif ev == "timer" then
-    if e[2] == lsTimer then broadcastState(); lsTimer = os.startTimer(LS_INTERVAL)
+    if e[2] == lsTimer then broadcastState(); if not live() then flushStale() end; lsTimer = os.startTimer(LS_INTERVAL)
     elseif e[2] == pokeTimer then
       -- self-heal a black/stale monitor (client render goes blank when you come into view). Only when the
       -- pad is EMPTY, so it never flickers while you're standing there using it.
