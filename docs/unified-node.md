@@ -89,14 +89,20 @@ state** (gossiped + persisted), the firmware copes without ever needing a *speci
   late gossip from resurrecting it. `ts` is fixed per id, so a beat/gossip can never push the deadline;
 - on boot a node restores the trip from disk, then `broadcastState` + `LSREQ` pull the latest trip/`done`
   from any reachable peer;
-- **gates are DETECTOR-GATED.** A node opens its onward tube only while the trip's **own rider** (by name)
-  is on its pad, and closes it the instant they leave. A gate **never opens speculatively** for a trip
-  whose rider isn't here — so a finished, phantom-live (destination missed the arrival), or resurrected
-  trip can't suck a bystander in, even when a reloaded node can't reach a peer. A reloaded junction still
-  delivers: the rider drops onto its pad and is flung onward. (`RELAUNCH_HOLD` is a brief, trip-scoped
-  cooldown after the rider leaves, so a bounce isn't instantly re-grabbed.)
-- the destination flips the shared trip to `done` only when its detector sees **the trip's own rider**
-  (matched by name, so a bystander can't complete someone else's trip); the `done` then gossips network-wide.
+- **gate policy by role:**
+  - a **JUNCTION** (mid-path) opens its onward tube **in advance / fly-through** while the trip is live, so
+    a *moving* rider sails straight through — and a rider who exits the previous tube and drops **onto the
+    detector block** lands at an already-open mouth and is pulled on. (Reactive opening can't do this — a
+    fast rider reaches the entrance before the poll fires.) On supersession the gate re-points to the new
+    next hop; it closes when the trip ends.
+  - the **ORIGIN** is **detector-gated**: it opens the launch tube only when the rider is on its pad — so a
+    reload re-launches a rider still standing there — and auto-closes after `RELAUNCH_HOLD` (trip-scoped,
+    anti-bounce).
+  - the **DESTINATION** flips `done` only when its detector sees **the trip's own rider** (by name), so a
+    bystander can't complete someone else's trip; `done` then gossips network-wide.
+- **tradeoff:** fly-through means a phantom-live (destination missed the arrival) or resurrected trip can
+  hold a junction tube open until it **ages out at `TRIP_TIMEOUT`** — bounded and self-clearing, accepted
+  so riders never drop mid-route.
 
 `test/htsim.lua` reproduces exactly this — including a junction that **reloads alone with no peer
 reachable** and recovers the trip from its own disk (Phase 14) — and asserts the merge order, expiry,

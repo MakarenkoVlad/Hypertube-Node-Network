@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v26"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v27"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -631,8 +631,10 @@ local function tripHint(t)
 end
 
 -- Close our gate when we are NOT an active tube-hop for the current trip (no live trip, off-path, the
--- destination, or a portal hop). For an origin/junction tube-hop the PAD POLL owns open/close by detector,
--- so reconcile leaves that gate alone (no flicker on every beat). Always refreshes the screen hint.
+-- destination, or a portal hop). A JUNCTION (mid-path tube-hop) opens its onward tube IN ADVANCE
+-- (fly-through) so a moving rider sails straight through - and one who drops onto the pad lands at an
+-- already-open mouth and is pulled onward. The ORIGIN's launch gate is detector-gated by the pad poll
+-- (so a reload re-launches a rider still on the pad). Always refreshes the screen hint.
 local function reconcile()
   local t = live()
   if not t then hintRef.text = nil; if opened then allStop(); opened = false end; return end
@@ -640,7 +642,9 @@ local function reconcile()
   local i = indexIn(t.path)
   if (not i) or i == #t.path or not controllerToward(t.path[i + 1]) then  -- off-path / destination / portal
     if opened then allStop(); opened = false end
-  end
+  elseif i > 1 then                                  -- JUNCTION: fly-through - keep the onward tube OPEN while
+    gateToward(t.path[i + 1]); opened = true          -- the trip is live (re-points if a newer trip supersedes)
+  end                                                -- origin (i==1): the pad poll owns the launch gate
 end
 
 -- ---- player presence -----------------------------------------------------
@@ -865,8 +869,8 @@ allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(monName or false)))
 if #monAll > 1 then log(("note: %d monitors - drawing to %s (pin with: firmware.lua monitor)"):format(#monAll, tostring(monName))) end
 if sharedWarn then log("WARNING: >1 detector - several nodes may share one wired network (firmware.lua diag)") end
-if next(LINKS) and not detector then log("WARNING: this node owns tube(s) but has NO Player Detector - it can't detector-gate a hand-off, so a mid-route rider won't be flung onward. Add a detector.") end
-if live() then log("restored trip -> " .. (trip.to or "?") .. " from shared state") end
+if live() then log("restored trip -> " .. (trip.to or "?") .. " from shared state"); reconcile() end  -- open a junction's
+                                -- onward tube IMMEDIATELY from the restored trip (don't wait for the first pad poll)
 pokeMonitor()                   -- un-stick a stale monitor frame (re-render) before drawing
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
                                 -- always shows current state even if this node has no modem
@@ -936,11 +940,14 @@ while true do
       elseif i == #t.path then                                          -- DESTINATION: confirm when OUR rider lands
         if onPad(t.rider) then arrive("arrived: " .. (t.rider or "traveller")); arrived = true
         elseif opened then allStop(); opened = false end
-      elseif controllerToward(t.path[i + 1]) then                       -- ORIGIN / JUNCTION tube-hop: DETECTOR-gated
+      elseif not controllerToward(t.path[i + 1]) then                   -- (portal hop: nothing to spin here)
+        if opened then allStop(); opened = false end
+      elseif i > 1 then                                                 -- JUNCTION: FLY-THROUGH - keep the onward
+        gateToward(t.path[i + 1]); opened = true                        -- tube open in advance (re-aims on supersede)
+      else                                                              -- ORIGIN (i==1): DETECTOR-gated launch
         if onPad(t.rider) and not (relaunchStop and relaunchStopFor == t.id) then  -- rider here, no SAME-trip cooldown
-          gateToward(t.path[i + 1]); opened = true                      -- (re)point the onward tube EVERY poll, so a
-                                                                        -- trip that superseded ours re-aims it (idempotent)
-        elseif opened and not onPad(t.rider) then                       -- they've been flung onward -> close + cooldown
+          gateToward(t.path[i + 1]); opened = true                      -- launch (re-opens after a reload if still on pad)
+        elseif opened and not onPad(t.rider) then                       -- they've launched -> close + anti-bounce cooldown
           allStop(); opened = false
           relaunchStop = os.startTimer(RELAUNCH_HOLD); relaunchStopFor = t.id
         end

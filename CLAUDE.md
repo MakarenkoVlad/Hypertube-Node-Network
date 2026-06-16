@@ -49,12 +49,15 @@ from one specific live peer (the user's requirement: "peers might be offloaded")
   blocks a late gossip from resurrecting it); `ts` is fixed per id, so beats/gossip can never push it;
 - on boot, `loadGraph` restores the trip, then `broadcastState` + `LSREQ` converge the latest trip/`done`
   from peers;
-- **gates are DETECTOR-GATED.** A node opens its onward tube only while the trip's **own rider** (by name)
-  is on its pad (the pad poll), and closes it the moment they leave. So a gate **never opens speculatively**
-  for a trip whose rider isn't physically here — no suck-back from a finished, phantom-live (destination
-  missed the arrival), or resurrected trip, even when a reloaded node can't reach a peer. A reloaded
-  junction still delivers: the rider drops onto its pad and is flung onward. (`RELAUNCH_HOLD` is a brief,
-  trip-id-scoped cooldown after a rider leaves, so a bounce isn't instantly re-grabbed.)
+- **gate policy by role.** A **JUNCTION** (mid-path) opens its onward tube **in advance / fly-through**
+  while the trip is live (`reconcile` → `gateToward`), so a *moving* rider sails straight through and one
+  who drops onto the pad lands at an already-open mouth and is pulled on (riders physically land **on the
+  detector block**, so the tube must already be open). The **ORIGIN** is **detector-gated** (pad poll):
+  it opens the launch tube only when the rider is on the pad — so a reload re-launches a rider still
+  standing there — and auto-closes after `RELAUNCH_HOLD` (trip-id-scoped, anti-bounce). The **DESTINATION**
+  flips `done` when its detector sees the trip's **own rider** (by name). Tradeoff: fly-through means a
+  phantom-live/resurrected trip can hold a junction tube open until it **ages out at `TRIP_TIMEOUT`**
+  (bounded, self-clearing) — accepted so riders never drop mid-route.
 
 This is the property `test/htsim.lua` exists to protect — it models unload/reload and a junction that
 **reloads alone with no peer reachable** yet recovers the trip from its own disk (Phase 14). **Run it
@@ -161,7 +164,7 @@ push.sh                   git add/commit/push helper; prints the node update com
 
 ```bash
 luacheck src/                 # static analysis; if missing: brew install luacheck
-lua test/htsim.lua            # MUST print "98 passed, 0 failed" (or update the count with intent)
+lua test/htsim.lua            # MUST print "91 passed, 0 failed" (or update the count with intent)
 ```
 
 A no-luacheck fallback full-parse: `lua -e "assert(loadfile('src/ht_node.lua'))"`. The firmware can't
