@@ -8,6 +8,7 @@
 -- ===========================================================================
 local RPM = 128
 local TRIP_TIMEOUT = 30
+local RELAUNCH_HOLD = 3        -- matches the firmware tunable (launch cooldown)
 local NOW = 1000
 local function dc(t) if type(t)~="table" then return t end local r={} for k,v in pairs(t) do r[k]=dc(v) end return r end
 local function tripExpired(t) return (not t) or (NOW-(tonumber(t.ts) or 0))>TRIP_TIMEOUT end
@@ -161,10 +162,10 @@ local function makeNode(name, links, portals)
     elseif self:controllerToward(t.path[i+1]) then                    -- origin/junction tube-hop
       local cooling = self.relaunchStop and NOW<self.relaunchStop and self.relaunchStopFor==t.id
       if here and not cooling then
-        if not self.opened then self:gateToward(t.path[i+1]); self.opened=true end
+        self:gateToward(t.path[i+1]); self.opened=true   -- (re)point EVERY poll so a superseding trip re-aims it
         return "open"
       elseif self.opened and not here then
-        self:allStop(); self.opened=false; self.relaunchStop=NOW+3; self.relaunchStopFor=t.id  -- close + SAME-trip cooldown
+        self:allStop(); self.opened=false; self.relaunchStop=NOW+RELAUNCH_HOLD; self.relaunchStopFor=t.id  -- close + cooldown
         return "closed"
       end
       return self.opened and "open" or "shut"
@@ -485,6 +486,35 @@ ok(bus.nodes["J"]:padPoll("Bystander")=="shut" and (bus.nodes["J"].gates.c2 or 0
    "a BYSTANDER on the junction pad opens NO gate -> no suck-back from the phantom-live trip")
 NOW=bus.nodes["J"]:live().ts+TRIP_TIMEOUT+1              -- and it self-clears at the absolute deadline
 ok(bus.nodes["J"]:padPoll(nil)=="idle" and bus.nodes["J"]:live()==nil, "the phantom trip ages out at TRIP_TIMEOUT")
+
+print("== Phase 19: a newer trip that supersedes while a junction gate is OPEN re-points the gate (MAJOR fix) ==")
+NOW=160000
+bus.nodes={}
+bus.nodes["S"]=makeNode("S",{c1="J"})
+bus.nodes["J"]=makeNode("J",{c1="S",c2="X",c3="Y"})     -- junction: c2->X, c3->Y
+bus.nodes["X"]=makeNode("X",{c1="J"})
+bus.nodes["Y"]=makeNode("Y",{c1="J"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["S"]:startTrip("X","Al"); bus:pump()           -- trip A: S>J>X
+bus.nodes["J"]:padPoll("Al")                             -- Al reaches J -> J opens toward X
+ok(bus.nodes["J"].gates.c2==RPM and (bus.nodes["J"].gates.c3 or 0)==0, "J opened toward X for trip A")
+NOW=NOW+2; bus.nodes["S"]:startTrip("Y","Bo"); bus:pump() -- a strictly-newer trip B: S>J>Y supersedes A via gossip
+ok(bus.nodes["J"]:live().to=="Y", "the newer trip B (to Y) superseded A at J while J's X tube is still open")
+bus.nodes["J"]:padPoll("Bo")                             -- Bo arrives at J while opened is still true toward X
+ok(bus.nodes["J"].gates.c3==RPM and (bus.nodes["J"].gates.c2 or 0)==0, "J RE-POINTED to Y and closed X (no misroute/strand)")
+
+print("== Phase 20: after the launch cooldown expires, a rider still on the pad is re-launched (anti-bounce recovery) ==")
+NOW=170000
+bus.nodes={}
+bus.nodes["O"]=makeNode("O",{c1="D"})
+bus.nodes["D"]=makeNode("D",{c1="O"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["O"]:startTrip("D","Ren"); bus:pump()          -- O opens its launch tube (opened)
+bus.nodes["O"]:padPoll(nil)                              -- Ren leaves -> close + arm cooldown
+ok((bus.nodes["O"].gates.c1 or 0)==0 and bus.nodes["O"].relaunchStop~=nil, "launch tube closed + cooldown armed after Ren left")
+ok(bus.nodes["O"]:padPoll("Ren")=="shut" and (bus.nodes["O"].gates.c1 or 0)==0, "during the cooldown, Ren bouncing back is NOT instantly re-grabbed")
+NOW=bus.nodes["O"].relaunchStop+1; bus.nodes["O"]:tick() -- cooldown expires
+ok(bus.nodes["O"]:padPoll("Ren")=="open" and bus.nodes["O"].gates.c1==RPM, "after the cooldown, Ren still on the pad is re-launched")
 
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end

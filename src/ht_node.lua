@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v25"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v26"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -823,7 +823,8 @@ local function startTrip(dest)
   local path = pathTo(dest)
   if not path then draw("No route to " .. dest, colors.red); return end
   local rider = riderOnPad()
-  if detector and not rider then draw("Step onto the pad first", colors.orange); return end
+  if not rider then draw("Step onto the pad first", colors.orange); return end  -- a trip MUST name its rider
+                                                                                -- (so a bystander can't gate/complete it)
   local ts = math.max(now(), (trip and tonumber(trip.ts) or 0) + 1)   -- strictly newer so adoptTrip can't reject ours
   if not adoptTrip({ id = NAME .. ":" .. ts, from = NAME, to = dest, path = path, rider = rider, ts = ts, done = false }) then
     refresh(); return                          -- couldn't become the shared trip (shouldn't happen with a forced ts)
@@ -847,7 +848,7 @@ local function handle(msg)
         log("trip " .. (t.to or "?") .. " : " .. (hintRef.text or "?"))
       end
     end
-    if (mapChanged or tripChanged) and not live() then refresh() end
+    if mapChanged or tripChanged then refresh() end   -- repaint immediately (incl. a live trip-change)
   elseif msg.type == "LSREQ" then
     broadcastState()                           -- "send me the shared state" - reply carries map AND trip
   end
@@ -864,6 +865,7 @@ allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(monName or false)))
 if #monAll > 1 then log(("note: %d monitors - drawing to %s (pin with: firmware.lua monitor)"):format(#monAll, tostring(monName))) end
 if sharedWarn then log("WARNING: >1 detector - several nodes may share one wired network (firmware.lua diag)") end
+if next(LINKS) and not detector then log("WARNING: this node owns tube(s) but has NO Player Detector - it can't detector-gate a hand-off, so a mid-route rider won't be flung onward. Add a detector.") end
 if live() then log("restored trip -> " .. (trip.to or "?") .. " from shared state") end
 pokeMonitor()                   -- un-stick a stale monitor frame (re-render) before drawing
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
@@ -936,7 +938,8 @@ while true do
         elseif opened then allStop(); opened = false end
       elseif controllerToward(t.path[i + 1]) then                       -- ORIGIN / JUNCTION tube-hop: DETECTOR-gated
         if onPad(t.rider) and not (relaunchStop and relaunchStopFor == t.id) then  -- rider here, no SAME-trip cooldown
-          if not opened then gateToward(t.path[i + 1]); opened = true end          -- -> open the onward tube
+          gateToward(t.path[i + 1]); opened = true                      -- (re)point the onward tube EVERY poll, so a
+                                                                        -- trip that superseded ours re-aims it (idempotent)
         elseif opened and not onPad(t.rider) then                       -- they've been flung onward -> close + cooldown
           allStop(); opened = false
           relaunchStop = os.startTimer(RELAUNCH_HOLD); relaunchStopFor = t.id
