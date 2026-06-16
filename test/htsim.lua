@@ -1,14 +1,16 @@
 -- ===========================================================================
 -- HT network simulator - mirrors ht_node.lua's logic and models the things
 -- that actually break it: chunks load/unload, offline nodes miss broadcasts,
--- reboots wipe RAM (only files persist), trips relay onto nodes that wake up
--- mid-route, periodic beats, and the absolute-deadline / done-set / persisted-
--- trip mechanics. PROTO/RPM/timeouts match the firmware.
+-- reboots wipe RAM (only files persist). The trip is SHARED state (gossiped in
+-- STATE, persisted to disk, merged by a (ts,id) total order with a monotonic
+-- `done` flag and a TRIP_TIMEOUT expiry) - a reloaded node recovers it from its
+-- own disk or any peer's gossip. RPM/timeouts match the firmware.
 -- ===========================================================================
 local RPM = 128
 local TRIP_TIMEOUT = 30
 local NOW = 1000
 local function dc(t) if type(t)~="table" then return t end local r={} for k,v in pairs(t) do r[k]=dc(v) end return r end
+local function tripExpired(t) return (not t) or (NOW-(tonumber(t.ts) or 0))>TRIP_TIMEOUT end
 
 local bus = { nodes = {}, q = {} }
 function bus:broadcast(from, msg)
@@ -25,33 +27,55 @@ function bus:pump()
 end
 
 local function makeNode(name, links, portals)
-  local nd = { NAME=name, LINKS=links, PORTALS=portals or {}, files={}, graph={}, gen={}, active=nil,
-               deadline=nil, done={}, gates={}, loaded=false, tripSeq=0 }
+  -- The single network trip lives in SHARED state (self.trip), gossiped in STATE and persisted to disk with
+  -- the map (self.files.state). Single-occupancy: newer ts supersedes; `done` monotonic; ages out at
+  -- TRIP_TIMEOUT. No ROUTE/ARRIVED/TRIPREQ - a node converges on the trip from gossip or its own disk.
+  local nd = { NAME=name, LINKS=links, PORTALS=portals or {}, files={}, graph={}, gen={}, trip=nil,
+               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false }
   function nd:myNeighbours()
     local s,o={},{}
     for _,nb in pairs(self.LINKS) do if not s[nb] then s[nb]=true; o[#o+1]=nb end end
     for _,nb in ipairs(self.PORTALS) do if not s[nb] then s[nb]=true; o[#o+1]=nb end end  -- portal links
     return o
   end
-  function nd:saveGraph() self.files.graph={ graph=dc(self.graph), gen=dc(self.gen) } end
+  -- ---- shared trip helpers (mirror firmware) ----
+  function nd:live() if self.trip and not self.trip.done and not tripExpired(self.trip) then return self.trip end end
+  function nd:adoptTrip(t)
+    if type(t)~="table" or not t.id or type(t.path)~="table" or tripExpired(t) then return false end
+    -- dc(t) on assign: real rednet serializes each message, so nodes never share a trip table. The in-process
+    -- bus passes refs, so without this a destination mutating done=true would silently flip it on every node.
+    if not self.trip then self.trip=dc(t)
+    elseif t.id==self.trip.id then
+      if t.done and not self.trip.done then self.trip.done=true else return false end  -- done is sticky
+    else
+      local tts,cts=tonumber(t.ts) or 0, tonumber(self.trip.ts) or 0  -- order by (ts,id): a total order so
+      if tts>cts or (tts==cts and t.id>self.trip.id) then self.trip=dc(t) else return false end  -- every node agrees
+    end
+    return true
+  end
+  -- ---- shared state persist + gossip ----
+  function nd:saveGraph() self.files.state={ graph=dc(self.graph), gen=dc(self.gen), trip=self.trip and dc(self.trip) or nil } end
   function nd:loadGraph()
-    local d=self.files.graph
+    local d=self.files.state
     if d and d.graph then for n,nbrs in pairs(d.graph) do
       if n~=self.NAME then self.graph[n]=dc(nbrs); self.gen[n]=(d.gen and d.gen[n]) or 0 end
     end end
+    if d and type(d.trip)=="table" and not tripExpired(d.trip) then self.trip=dc(d.trip) end
   end
   function nd:broadcastState()
     self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW; self:saveGraph()
     local nodes={} for n,nbrs in pairs(self.graph) do nodes[n]={nbrs=nbrs, ts=self.gen[n] or 0} end
-    bus:broadcast(self.NAME, { type="STATE", nodes=nodes })
+    bus:broadcast(self.NAME, { type="STATE", nodes=nodes, trip=self.trip and dc(self.trip) or nil })
   end
-  function nd:mergeState(nodes)
-    local ch=false
-    for n,info in pairs(nodes) do if type(info)=="table" and type(info.nbrs)=="table" then
+  function nd:mergeState(nodes, gtrip)
+    local mc=false
+    if type(nodes)=="table" then for n,info in pairs(nodes) do if type(info)=="table" and type(info.nbrs)=="table" then
       local ts=info.ts or 0
-      if not self.gen[n] or ts>self.gen[n] then self.graph[n]=dc(info.nbrs); self.gen[n]=ts; ch=true end
-    end end
-    if ch then self:saveGraph() end; return ch
+      if not self.gen[n] or ts>self.gen[n] then self.graph[n]=dc(info.nbrs); self.gen[n]=ts; mc=true end
+    end end end
+    local tc = gtrip~=nil and self:adoptTrip(gtrip)
+    if mc or tc then self:saveGraph() end
+    return mc, tc
   end
   function nd:pathTo(dest)
     if dest==self.NAME then return {self.NAME} end
@@ -65,72 +89,91 @@ local function makeNode(name, links, portals)
   function nd:gateToward(nb) for c,d in pairs(self.LINKS) do self.gates[c]=(nb~=nil and d==nb) and RPM or 0 end end
   function nd:allStop() self:gateToward(nil) end
   function nd:indexIn(p) for i,n in ipairs(p) do if n==self.NAME then return i end end end
-  function nd:applyTrip(t)
-    self.relaunch=nil                                     -- a new trip supersedes any prior auto-close
+  function nd:tripHint(t)   -- screen hint only (gates are detector-driven, never opened here)
     local i=self:indexIn(t.path)
-    if not i then self:allStop(); return nil end
-    if i==#t.path then self:allStop(); return "Arrived" end
+    if not i then return nil end
+    if i==#t.path then return "Arrived" end
     local nxt=t.path[i+1]
-    if not self:controllerToward(nxt) then self:allStop(); return "portal->"..nxt end
-    self:gateToward(nxt)
-    if i==1 then self.relaunch=NOW+3; return "Board->"..nxt end
+    if not self:controllerToward(nxt) then return "portal->"..nxt end
+    if i==1 then return "Board->"..nxt end
     return "Pass->"..nxt
   end
-  function nd:setActive(t) self.active=t; self.deadline=(t.ts or NOW)+TRIP_TIMEOUT end
-  function nd:markDone(id) if id then self.done[id]=NOW+TRIP_TIMEOUT end end
-  function nd:pruneDone() for id,exp in pairs(self.done) do if NOW>exp then self.done[id]=nil end end end
-  function nd:endTrip()
-    if self.active then self:markDone(self.active.id) end
-    self.active=nil; self.deadline=nil; self.relaunch=nil; self:allStop()
+  -- close our gate when we're NOT an active tube-hop (off-path/destination/portal/not-live); leave an
+  -- origin/junction tube-hop's gate to the detector-driven pad poll.
+  function nd:reconcile()
+    local t=self:live()
+    if not t then self.lastHint=nil; if self.opened then self:allStop(); self.opened=false end; return end
+    self.lastHint=self:tripHint(t)
+    local i=self:indexIn(t.path)
+    if (not i) or i==#t.path or not self:controllerToward(t.path[i+1]) then
+      if self.opened then self:allStop(); self.opened=false end
+    end
   end
   function nd:startTrip(dest, rider)
     if dest==self.NAME then return "self" end
-    self:pruneDone()
+    if self:live() and (NOW-(self.trip.ts or 0))<1.5 then return end   -- debounce; re-tap still re-routes
     local path=self:pathTo(dest); if not path then return nil end
     self.tripSeq=self.tripSeq+1
-    local t={ type="ROUTE", id=self.NAME..":"..self.tripSeq, from=self.NAME, to=dest, path=path, ts=NOW, rider=rider }
-    bus:broadcast(self.NAME, t); self:setActive(t); self.lastHint=self:applyTrip(t)
+    local ts=math.max(NOW, (self.trip and tonumber(self.trip.ts) or 0)+1)  -- strictly newer so adoptTrip can't reject
+    if not self:adoptTrip({ id=self.NAME..":"..self.tripSeq, from=self.NAME, to=dest, path=path, rider=rider, ts=ts, done=false }) then return nil end
+    self.relaunchStop=nil; self.lastHint="Board->"..dest
+    self:saveGraph(); self:broadcastState()                -- publish the new trip as shared state
+    self:gateToward(path[2]); self.opened=true             -- fling off our pad; the pad poll closes it when they leave
     return path
+  end
+  function nd:arrive()                                     -- DESTINATION: flip the shared trip to done + gossip
+    if self.trip then self.trip.done=true; self:saveGraph(); self:broadcastState() end
+    self.relaunchStop=nil
+    if self.opened then self:allStop(); self.opened=false end
+    self:reconcile()
   end
   function nd:handle(msg)
     if type(msg)~="table" then return end
-    if msg.type=="STATE" then self:mergeState(msg.nodes)
-    elseif msg.type=="LSREQ" then self:broadcastState()
-    elseif msg.type=="TRIPREQ" then if self.active then bus:broadcast(self.NAME, self.active) end
-    elseif msg.type=="ROUTE" and msg.path and msg.id then
-      self:pruneDone()
-      if self.done[msg.id] then return end                  -- finished trip: ignore late beats
-      if self.active and self.active.id==msg.id then
-        self.active=msg; return                             -- same trip: keep alive, DON'T reset deadline
-      end
-      self:setActive(msg); self.lastHint=self:applyTrip(msg)
-    elseif msg.type=="ARRIVED" then
-      self:markDone(msg.id)
-      if self.active and (msg.id==nil or self.active.id==msg.id) then self:endTrip() end
-    end
+    if msg.type=="STATE" then
+      local _,tc=self:mergeState(msg.nodes, msg.trip)
+      if tc then self:reconcile() end
+    elseif msg.type=="LSREQ" then self:broadcastState() end
   end
-  function nd:beat() if self.active then bus:broadcast(self.NAME, self.active) end end
+  function nd:beat() if self:live() then self:broadcastState() end end  -- re-gossip the shared trip
   function nd:boot()
-    -- cold boot: RAM is wiped (active/done/gates), only files (the map) persist
-    self.loaded=true; self.graph={}; self.gen={}; self.active=nil; self.gates={}
-    self.relaunch=nil; self.deadline=nil; self.done={}
+    self.loaded=true; self.graph={}; self.gen={}; self.trip=nil; self.gates={}
+    self.relaunchStop=nil; self.opened=false; self.lastHint=nil
     self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW
-    self:loadGraph(); self:broadcastState()
-    bus:broadcast(self.NAME, { type="LSREQ" }); bus:broadcast(self.NAME, { type="TRIPREQ" })
+    self:loadGraph()                                       -- recover map AND trip from disk
+    self:broadcastState()
+    bus:broadcast(self.NAME, { type="LSREQ" })             -- ask for shared state (reply carries map + trip/done)
   end
   function nd:unload() self.loaded=false end
-  function nd:tick()
-    if self.relaunch and NOW>=self.relaunch then self.relaunch=nil; self:allStop() end
-    if self.active and self.deadline and NOW>=self.deadline then
-      self:markDone(self.active.id); self.active=nil; self.deadline=nil; self.relaunch=nil; self:allStop()
+  function nd:tick() if self.relaunchStop and NOW>=self.relaunchStop then self.relaunchStop=nil end end  -- cooldown over
+  -- DETECTOR-gated pad poll; `who` = name on our pad (nil if none). Mirrors the firmware pad-timer branch.
+  function nd:padPoll(who)
+    local t=self:live()
+    local i=t and self:indexIn(t.path)
+    local here = t and who~=nil and ((not t.rider) or who==t.rider)   -- our trip's rider is on our pad
+    if not t or not i then
+      if self.trip and tripExpired(self.trip) then self.trip=nil; self:saveGraph() end
+      if self.opened then self:allStop(); self.opened=false end
+      return "idle"
+    elseif i==#t.path then                                            -- destination
+      if here then self:arrive(); return "arrived" end
+      if self.opened then self:allStop(); self.opened=false end
+      return "waiting"
+    elseif self:controllerToward(t.path[i+1]) then                    -- origin/junction tube-hop
+      local cooling = self.relaunchStop and NOW<self.relaunchStop and self.relaunchStopFor==t.id
+      if here and not cooling then
+        if not self.opened then self:gateToward(t.path[i+1]); self.opened=true end
+        return "open"
+      elseif self.opened and not here then
+        self:allStop(); self.opened=false; self.relaunchStop=NOW+3; self.relaunchStopFor=t.id  -- close + SAME-trip cooldown
+        return "closed"
+      end
+      return self.opened and "open" or "shut"
     end
+    return "noop"
   end
-  function nd:landPad(who)  -- player `who` lands here; only confirms for the trip's OWN rider
-    if self.active and self.active.to==self.NAME and ((not self.active.rider) or who==self.active.rider) then
-      bus:broadcast(self.NAME, { type="ARRIVED", at=self.NAME, id=self.active.id })
-      self:markDone(self.active.id); self.active=nil; self.deadline=nil; self.relaunch=nil; self:allStop(); return true
-    end
-    return false
+  function nd:landPad(who)  -- destination-arrival helper for the phases; no arg = the trip's own rider lands
+    local t=self:live()
+    return self:padPoll(who or (t and t.rider) or "player")=="arrived"
   end
   return nd
 end
@@ -138,7 +181,7 @@ end
 -- ---- assertions ----
 local pass, fail = 0, 0
 local function ok(cond, label) if cond then pass=pass+1; print("  PASS  "..label) else fail=fail+1; print("  FAIL  "..label) end end
-local function anyActive() for _,nd in pairs(bus.nodes) do if nd.active~=nil then return true end end return false end
+local function anyActive() for _,nd in pairs(bus.nodes) do if nd:live()~=nil then return true end end return false end
 
 -- ---- build the star network (user's actual topology) ----
 local AV="Avenger2256"; local HUB="Right Island Hub"; local TER="Terrapin Station"; local ALO="Al0p"
@@ -153,7 +196,7 @@ bus:pump()
 ok(bus.nodes[AV]:pathTo(TER) and table.concat(bus.nodes[AV]:pathTo(TER),">")==AV..">"..HUB..">"..TER, "Avenger computes Avenger>Hub>Terrapin")
 ok(bus.nodes[TER]:pathTo(AV)  ~= nil, "Terrapin can route to Avenger")
 ok(bus.nodes[ALO]:pathTo(TER) ~= nil, "Al0p can route to Terrapin (multi-hop)")
-ok(bus.nodes[AV].files.graph~=nil, "graph persisted to disk on Avenger")
+ok(bus.nodes[AV].files.state~=nil, "shared state persisted to disk on Avenger")
 
 print("== Phase 2: unload everyone but Avenger (chunks off) ==")
 NOW=NOW+100
@@ -162,30 +205,32 @@ ok(not bus.nodes[HUB].loaded and not bus.nodes[TER].loaded, "Hub & Terrapin are 
 ok(bus.nodes[AV]:pathTo(TER)~=nil, "Avenger STILL routes to Terrapin from persisted map (the key fix)")
 
 print("== Phase 3: start trip with the hub & dest OFFLINE, then they load mid-route ==")
-local path = bus.nodes[AV]:startTrip(TER); bus:pump()
+local path = bus.nodes[AV]:startTrip(TER, "Ada"); bus:pump()
 ok(path and table.concat(path,">")==AV..">"..HUB..">"..TER, "trip starts, path is Avenger>Hub>Terrapin")
-ok(bus.nodes[AV].gates.c1==RPM, "Avenger (origin) opened its tube toward the hub")
-ok(bus.nodes[HUB].active==nil, "hub heard nothing yet (it was unloaded at departure)")
+ok(bus.nodes[AV].gates.c1==RPM, "Avenger (origin) opened its tube toward the hub (Ada on the pad)")
+ok(bus.nodes[HUB]:live()==nil, "hub heard nothing yet (it was unloaded at departure)")
 
 NOW=NOW+5  -- player flies toward hub; hub chunk loads
-bus.nodes[HUB]:boot(); bus:pump()      -- boot sends TRIPREQ; Avenger (still loaded) relays the trip
-ok(bus.nodes[HUB].active~=nil, "hub booted mid-route and PICKED UP the trip via relay")
-ok(bus.nodes[HUB].gates.c2==RPM, "hub opened its tube toward Terrapin (the junction switch)")
-ok(bus.nodes[HUB].gates.c1==0 and bus.nodes[HUB].gates.c3==0, "hub closed the other tubes (no misroute)")
+bus.nodes[HUB]:boot(); bus:pump()      -- boot asks for shared state (LSREQ); Avenger (loaded) replies STATE w/ trip
+ok(bus.nodes[HUB]:live()~=nil, "hub booted mid-route and PICKED UP the trip from SHARED STATE")
+ok((bus.nodes[HUB].gates.c2 or 0)==0, "hub holds every tube shut until it actually sees the rider (detector-gated)")
+bus.nodes[HUB]:padPoll("Ada")          -- Ada drops onto the hub pad
+ok(bus.nodes[HUB].gates.c2==RPM, "hub opens its Terrapin tube once Ada is on its pad (the junction switch)")
+ok(bus.nodes[HUB].gates.c1==0 and bus.nodes[HUB].gates.c3==0, "hub opened ONLY the Terrapin tube (no misroute)")
 
-NOW=NOW+3; bus.nodes[AV]:tick()        -- origin auto-close window passes
-ok(bus.nodes[AV].gates.c1==0, "Avenger auto-closed its launch tube (no suck-back)")
-ok(bus.nodes[AV].active~=nil, "Avenger still HOLDS the trip for relay (didn't forget it)")
+bus.nodes[AV]:padPoll(nil)             -- Ada has left Avenger's pad
+ok(bus.nodes[AV].gates.c1==0, "Avenger closed its launch tube once Ada left (no suck-back)")
+ok(bus.nodes[AV]:live()~=nil, "Avenger still holds the trip in shared state (didn't forget it)")
 
 NOW=NOW+5  -- player flies hub->Terrapin; Terrapin chunk loads
 bus.nodes[TER]:boot(); bus:pump()
-ok(bus.nodes[TER].active~=nil, "Terrapin booted and picked up the trip via relay from the hub")
-ok(bus.nodes[TER]:applyTrip(bus.nodes[TER].active)=="Arrived", "Terrapin recognises itself as the destination")
+ok(bus.nodes[TER]:live()~=nil, "Terrapin booted and picked up the trip from shared state")
+ok(bus.nodes[TER]:tripHint(bus.nodes[TER]:live())=="Arrived", "Terrapin recognises itself as the destination")
 
-local arrived = bus.nodes[TER]:landPad(); bus:pump()
-ok(arrived, "player lands on Terrapin pad -> ARRIVED broadcast")
-ok(bus.nodes[HUB].active==nil and bus.nodes[AV].active==nil, "ARRIVED cleared the trip on hub & Avenger")
-ok(bus.nodes[HUB].gates.c2==0, "hub closed its Terrapin tube after the trip")
+local arrived = bus.nodes[TER]:landPad("Ada"); bus:pump()
+ok(arrived, "Ada lands on Terrapin pad -> trip flipped to done + gossiped")
+ok(bus.nodes[HUB]:live()==nil and bus.nodes[AV]:live()==nil, "the gossiped done cleared the trip on hub & Avenger")
+ok((bus.nodes[HUB].gates.c2 or 0)==0, "hub closed its Terrapin tube after the trip")
 
 print("== Phase 4: gossip - a fresh node learns the whole map from ONE loaded peer ==")
 local LONE = makeNode("Lonely", { c1=HUB }); bus.nodes["Lonely"]=LONE
@@ -205,7 +250,7 @@ NOW=20000
 for _,nd in pairs(bus.nodes) do nd.loaded=true; nd:boot() end; bus:pump()
 local tstart=NOW
 bus.nodes[AV]:startTrip(TER); bus:pump()                 -- Avenger>Hub>Terrapin, all loaded
-ok(bus.nodes[AV].active~=nil and bus.nodes[HUB].active~=nil, "trip active on origin and junction")
+ok(bus.nodes[AV]:live()~=nil and bus.nodes[HUB]:live()~=nil, "trip active on origin and junction")
 for _=1,20 do                                            -- rider vanishes; nodes keep beating for 40s
   NOW=NOW+2
   for _,nd in pairs(bus.nodes) do nd:beat() end
@@ -219,36 +264,41 @@ print("== Phase 7: ARRIVED is final - a late beat cannot resurrect a finished tr
 NOW=30000
 for _,nd in pairs(bus.nodes) do nd.loaded=true; nd:boot() end; bus:pump()
 bus.nodes[AV]:startTrip(TER); bus:pump()                 -- Avenger>Hub>Terrapin
-local ghost = dc(bus.nodes[TER].active)                  -- capture the in-flight ROUTE before arrival
-ok(ghost~=nil, "destination is holding the in-flight ROUTE")
-bus.nodes[TER]:landPad(); bus:pump()                     -- ARRIVED -> everyone clears + marks done
-ok(not anyActive(), "all nodes cleared after ARRIVED")
-bus:broadcast("ghost", ghost); bus:pump()                -- a straggler beat of the SAME id arrives
-ok(not anyActive(), "late beat ignored via done-set; trip NOT resurrected")
+local ghost = dc(bus.nodes[TER]:live())                  -- capture the in-flight trip (done=false) before arrival
+ok(ghost~=nil, "destination is holding the in-flight trip in shared state")
+bus.nodes[TER]:landPad(); bus:pump()                     -- arrival -> done=true gossiped, everyone clears
+ok(not anyActive(), "all nodes cleared after the trip was marked done")
+bus:broadcast("ghost", { type="STATE", nodes={}, trip=ghost }); bus:pump()  -- a stale gossip of the SAME id (done=false)
+ok(not anyActive(), "stale gossip ignored - done is monotonic, trip NOT resurrected")
 
-print("== Phase 8: a reloaded node never re-opens a phantom gate after the rider already arrived (no suck-back) ==")
+print("== Phase 8: a junction that reloads AFTER its rider arrived is told 'done' by a peer (no stale-trip suck-back) ==")
 NOW=40000
 for _,nd in pairs(bus.nodes) do nd.loaded=true; nd:boot() end; bus:pump()
-bus.nodes[AV]:startTrip(TER); bus:pump()                 -- hub opens its Terrapin tube as a hop
-ok(bus.nodes[HUB].gates.c2==RPM, "hub opened its Terrapin tube for the trip")
+bus.nodes[AV]:startTrip(TER,"Rae"); bus:pump()           -- Rae rides Avenger>Hub>Terrapin; hub is a junction
+bus.nodes[HUB]:padPoll("Rae")                            -- Rae reaches the hub pad
+ok(bus.nodes[HUB].gates.c2==RPM, "hub opened its Terrapin tube for the trip (Rae on its pad)")
+ok(bus.nodes[HUB].files.state.trip~=nil, "hub persisted the trip (shared state) while mid-route")
 bus.nodes[HUB]:unload()                                  -- hub's chunk unloads while the rider is mid-route
-bus.nodes[TER]:landPad(); bus:pump()                     -- rider arrives; ARRIVED is sent but hub is OFF, misses it
-NOW=NOW+4; bus.nodes[HUB]:boot(); bus:pump()             -- hub reloads (within the deadline window)
-ok(bus.nodes[HUB].active==nil, "reloaded hub has NO active trip (trip state is RAM-only, not resurrected)")
-ok((bus.nodes[HUB].gates.c2 or 0)==0, "reloaded hub did NOT re-open its tube -> no phantom suck-back")
+bus.nodes[TER]:landPad("Rae"); bus:pump()                -- Rae arrives at Terrapin; done=true gossiped but hub is OFF
+NOW=NOW+4; bus.nodes[HUB]:boot(); bus:pump()             -- hub reloads, restores trip from disk, asks for shared state;
+                                                         -- Terrapin's reply carries the SAME trip flagged done
+ok(bus.nodes[HUB]:live()==nil, "reloaded hub learned the trip finished from shared state -> not live (no stale hold)")
+ok(bus.nodes[HUB].files.state.trip.done==true, "it recorded the trip as done (the monotonic finished-marker)")
+ok((bus.nodes[HUB].gates.c2 or 0)==0, "hub never re-opened its tube -> no suck-back even if Rae walks back later")
 
-print("== Phase 9: a finished origin's stale auto-close timer can't shut a LATER pass-through gate ==")
+print("== Phase 9: a finished trip's launch cooldown can't strand a LATER pass-through (trip-specific) ==")
 NOW=50000
 for _,nd in pairs(bus.nodes) do nd.loaded=true; nd:boot() end; bus:pump()
-NOW=NOW+1; bus.nodes[HUB]:startTrip(TER); bus:pump()     -- hub is ORIGIN -> arms its relaunch auto-close
-ok(bus.nodes[HUB].relaunch~=nil, "hub-as-origin armed a relaunch auto-close timer")
-NOW=NOW+1; bus.nodes[TER]:landPad(); bus:pump()          -- trip ends -> hub endTrip must clear that timer
-ok(bus.nodes[HUB].relaunch==nil, "ending the trip cleared the origin's stale auto-close timer")
-NOW=NOW+3; bus.nodes[AV]:startTrip(ALO); bus:pump()      -- NEW trip passes THROUGH hub (Avenger>Hub>Al0p)
-ok(bus.nodes[HUB].gates.c3==RPM, "hub opened its pass-through tube toward Al0p")
-NOW=NOW+1; bus.nodes[HUB]:tick()                         -- the old auto-close instant is now past
-ok(bus.nodes[HUB].gates.c3==RPM, "stale auto-close did NOT shut the pass-through gate (rider not stranded)")
-ok(bus.nodes[HUB].active~=nil, "pass-through trip is still active at the junction")
+NOW=NOW+1; bus.nodes[HUB]:startTrip(TER,"Ki"); bus:pump() -- HUB is ORIGIN of trip1
+ok(bus.nodes[HUB].gates.c2==RPM, "hub-as-origin launched trip1 toward Terrapin")
+bus.nodes[HUB]:padPoll(nil)                              -- Ki leaves the hub -> close + arm a trip1-specific cooldown
+ok(bus.nodes[HUB].relaunchStop~=nil, "hub armed a launch cooldown after Ki left")
+NOW=NOW+1; bus.nodes[TER]:landPad("Ki"); bus:pump()      -- trip1 ends (done gossiped to the hub)
+ok(bus.nodes[HUB]:live()==nil, "trip1 finished -> not live at the hub")
+NOW=NOW+1; bus.nodes[AV]:startTrip(ALO,"Lo"); bus:pump() -- NEW trip2 passes THROUGH hub (Avenger>Hub>Al0p)
+bus.nodes[HUB]:padPoll("Lo")                             -- Lo reaches the hub; trip1's cooldown is still ticking
+ok(bus.nodes[HUB].gates.c3==RPM, "the stale trip1 cooldown did NOT block trip2's gate (rider not stranded)")
+ok(bus.nodes[HUB]:live()~=nil and (bus.nodes[HUB].gates.c2 or 0)==0, "hub opened ONLY trip2's Al0p tube")
 
 print("== Phase 10: round trip leaves NO gate stuck open (the reported goldmine bug) ==")
 NOW=60000
@@ -258,17 +308,20 @@ bus.nodes[T2]=makeNode(T2,{c1=H2})
 bus.nodes[H2]=makeNode(H2,{c1=T2,c2=G2})
 bus.nodes[G2]=makeNode(G2,{c1=H2})
 for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
-bus.nodes[T2]:startTrip(G2); bus:pump()                  -- Terrapin -> goldmine, through the hub
-local trip1=dc(bus.nodes[H2].active)                     -- the in-flight ROUTE the hub is holding
-ok(bus.nodes[H2].gates.c2==RPM, "hub opened its goldmine tube while routing there")
-bus.nodes[G2]:landPad(); bus:pump()                      -- arrive at goldmine -> ARRIVED clears everyone
+bus.nodes[T2]:startTrip(G2,"Wim"); bus:pump()            -- Terrapin -> goldmine, through the hub
+local trip1=dc(bus.nodes[H2]:live())                     -- the in-flight trip the hub is holding (done=false)
+bus.nodes[H2]:padPoll("Wim")                             -- Wim reaches the hub
+ok(bus.nodes[H2].gates.c2==RPM, "hub opened its goldmine tube while routing Wim there")
+bus.nodes[G2]:landPad("Wim"); bus:pump()                 -- arrive at goldmine -> done gossiped, clears everyone
 ok((bus.nodes[H2].gates.c2 or 0)==0, "hub CLOSED its goldmine tube on arrival (entrance not left open)")
 ok(not anyActive(), "no trip left active after arriving at goldmine")
-bus:broadcast("ghost", trip1); bus:pump()                -- a straggler beat of the finished trip
-ok((bus.nodes[H2].gates.c2 or 0)==0, "stale beat did NOT re-open the goldmine entrance (no suck-back)")
-bus.nodes[G2]:startTrip(T2); bus:pump()                  -- the "came back" leg: goldmine -> Terrapin
+bus:broadcast("ghost", { type="STATE", nodes={}, trip=trip1 }); bus:pump()  -- a stale gossip of the finished trip (done=false)
+bus.nodes[H2]:padPoll("Wim")                             -- ...even with Wim back on the hub pad
+ok((bus.nodes[H2].gates.c2 or 0)==0, "stale gossip + rider present did NOT re-open the goldmine tube (done is monotonic)")
+bus.nodes[G2]:startTrip(T2,"Wim"); bus:pump()            -- the "came back" leg: goldmine -> Terrapin
+bus.nodes[H2]:padPoll("Wim")                             -- Wim reaches the hub on the return
 ok(bus.nodes[H2].gates.c1==RPM and (bus.nodes[H2].gates.c2 or 0)==0, "return trip opens hub->Terrapin only; goldmine tube stays shut")
-bus.nodes[T2]:landPad(); bus:pump()
+bus.nodes[T2]:landPad("Wim"); bus:pump()
 ok(not anyActive() and (bus.nodes[H2].gates.c1 or 0)==0, "back home; every hub gate closed")
 
 print("== Phase 11: a portal (walk-through) hop routes across to a roof / Nether node ==")
@@ -284,8 +337,8 @@ ok(pp and table.concat(pp,">")==S3..">"..HB3..">"..RF3, "Surface routes to Roof 
 bus.nodes[S3]:startTrip(RF3); bus:pump()
 ok(bus.nodes[HB3].lastHint and bus.nodes[HB3].lastHint:find("portal"), "hub tells the rider to WALK THROUGH the portal to Roof")
 ok((bus.nodes[HB3].gates.c1 or 0)==0, "hub spins no tube for the portal hop (there is none)")
-ok(bus.nodes[RF3].active~=nil, "roof node received the trip over rednet (ender modems cross dimensions)")
-ok(bus.nodes[RF3]:applyTrip(bus.nodes[RF3].active)=="Arrived", "roof recognises itself as the destination after the walk-through")
+ok(bus.nodes[RF3]:live()~=nil, "roof node received the trip over rednet (ender modems cross dimensions)")
+ok(bus.nodes[RF3]:tripHint(bus.nodes[RF3]:live())=="Arrived", "roof recognises itself as the destination after the walk-through")
 
 print("== Phase 12: destination ordering - distance asc/desc, alphabetical, and filter ==")
 NOW=80000
@@ -328,12 +381,110 @@ bus.nodes["A"]=makeNode("A",{c1="B"})
 bus.nodes["B"]=makeNode("B",{c1="A"})
 for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
 bus.nodes["A"]:startTrip("B","Alice"); bus:pump()        -- Alice boards at A, bound for B
-ok(bus.nodes["B"].active and bus.nodes["B"].active.rider=="Alice", "destination B knows the rider is Alice")
+ok(bus.nodes["B"]:live() and bus.nodes["B"]:live().rider=="Alice", "destination B knows the rider is Alice")
 ok(bus.nodes["B"]:landPad("Bob")==false, "a bystander (Bob) on B's pad does NOT confirm Alice's trip")
-ok(bus.nodes["B"].active~=nil and bus.nodes["A"].active~=nil, "trip stays active while only Bob is present")
+ok(bus.nodes["B"]:live()~=nil and bus.nodes["A"]:live()~=nil, "trip stays active while only Bob is present")
 ok(bus.nodes["B"]:landPad("Alice")==true, "Alice landing on B confirms arrival")
 bus:pump()                                               -- deliver ARRIVED to node A
 ok(not anyActive(), "trip cleared on every node once the actual rider arrived")
+
+print("== Phase 14: a junction that reloads ALONE (no peer) recovers the trip from disk + catches its rider ==")
+-- The field bug: Right Island Hub kept rebooting (chunk cycling). With the trip in SHARED state, the Hub
+-- recovers it from its OWN disk - no live peer needed - and opens onward when its rider drops onto its pad.
+NOW=100000
+bus.nodes={}
+bus.nodes["Spawn"]   =makeNode("Spawn",   {c1="Terrapin"})
+bus.nodes["Terrapin"]=makeNode("Terrapin",{c1="Spawn",c2="Hub"})
+bus.nodes["Hub"]     =makeNode("Hub",     {c1="Terrapin",c2="Al0p",c3="Other"})  -- the junction
+bus.nodes["Al0p"]    =makeNode("Al0p",    {c1="Hub"})
+bus.nodes["Other"]   =makeNode("Other",   {c1="Hub"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["Spawn"]:startTrip("Al0p","Isuenon"); bus:pump()
+ok(bus.nodes["Hub"]:live() and table.concat(bus.nodes["Hub"]:live().path,">")=="Spawn>Terrapin>Hub>Al0p",
+   "trip routes Spawn>Terrapin>Hub>Al0p")
+ok(bus.nodes["Hub"].files.state.trip~=nil, "Hub persisted the in-flight trip (shared state) to disk")
+for n,nd in pairs(bus.nodes) do if n~="Hub" then nd:unload() end end  -- every peer goes offline...
+bus.nodes["Hub"]:unload()                                            -- ...and the Hub cycles its chunk
+NOW=NOW+3; bus.nodes["Hub"]:boot(); bus:pump()                       -- reloads ALONE: no peer answers LSREQ
+ok(bus.nodes["Hub"]:live()~=nil, "Hub recovered the trip from its OWN DISK despite no peer reachable")
+ok((bus.nodes["Hub"].gates.c2 or 0)==0, "with no rider on its pad yet, the Hub opens NO tube (detector-gated, no suck-back)")
+ok(bus.nodes["Hub"]:padPoll("Stranger")=="shut" and (bus.nodes["Hub"].gates.c2 or 0)==0, "a stranger on the pad does NOT open it")
+bus.nodes["Hub"]:padPoll("Isuenon")                                 -- Isuenon drops onto the reloaded Hub's pad
+ok(bus.nodes["Hub"].gates.c2==RPM, "Hub opens its Al0p tube when Isuenon lands -> flung onward, not stranded")
+
+print("== Phase 15: a finished trip stays DONE in shared state, so a later reload opens no gate (no resurrection) ==")
+NOW=110000
+bus.nodes={}
+bus.nodes["Spawn"]=makeNode("Spawn",{c1="Hub"})
+bus.nodes["Hub"]  =makeNode("Hub",  {c1="Spawn",c2="Dest"})
+bus.nodes["Dest"] =makeNode("Dest", {c1="Hub"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["Spawn"]:startTrip("Dest","Zed"); bus:pump()
+bus.nodes["Hub"]:padPoll("Zed")                          -- Zed reaches the hub
+ok(bus.nodes["Hub"]:live()~=nil and bus.nodes["Hub"].gates.c2==RPM, "Hub is mid-route with its Dest tube open")
+bus.nodes["Dest"]:landPad("Zed"); bus:pump()             -- arrival -> done=true gossiped to every node
+ok(bus.nodes["Hub"]:live()==nil, "the gossiped done cleared the live trip at the Hub")
+ok(bus.nodes["Hub"].files.state.trip.done==true, "the Hub's persisted trip is flagged done (kept as the finished-marker)")
+ok((bus.nodes["Hub"].gates.c2 or 0)==0, "Hub closed its Dest tube on the done")
+NOW=NOW+1; bus.nodes["Hub"]:boot(); bus:pump()           -- a later, unrelated reload
+ok(bus.nodes["Hub"]:live()==nil, "the reload restores the trip as DONE -> not live (no resurrection)")
+bus.nodes["Hub"]:padPoll("Zed")                          -- even Zed back on the pad
+ok((bus.nodes["Hub"].gates.c2 or 0)==0, "opens no gate even with a rider present (the trip is done)")
+
+print("== Phase 16: integrated detector-gated pad poll - shut until rider, open, close-on-leave, arrival, expiry ==")
+NOW=120000
+bus.nodes={}
+bus.nodes["O"]=makeNode("O",{c1="J"})
+bus.nodes["J"]=makeNode("J",{c1="O",c2="D",c3="X"})      -- junction with a decoy tube X
+bus.nodes["D"]=makeNode("D",{c1="J"})
+bus.nodes["X"]=makeNode("X",{c1="J"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["O"]:startTrip("D","Liv"); bus:pump()          -- O>J>D ; J is the junction
+local J=bus.nodes["J"]
+ok(J:live() and J:live().to=="D", "junction holds the live trip")
+ok((J.gates.c2 or 0)==0, "junction is SHUT until the rider arrives (no speculative open)")
+ok(J:padPoll(nil)=="shut" and (J.gates.c2 or 0)==0, "poll with nobody present keeps it shut")
+ok(J:padPoll("Liv")=="open" and J.gates.c2==RPM, "rider on the pad -> opens the D tube (not the decoy X)")
+ok((J.gates.c3 or 0)==0, "the decoy tube X stays shut (only the on-path tube opens)")
+ok(J:padPoll("Liv")=="open" and J.gates.c2==RPM, "idempotent: stays open while the rider is present")
+ok(J:padPoll(nil)=="closed" and (J.gates.c2 or 0)==0, "rider flung onward (gone) -> junction shuts its mouth at once")
+ok(bus.nodes["D"]:padPoll(nil)=="waiting", "destination with nobody present just waits")
+ok(bus.nodes["D"]:padPoll("Liv")=="arrived", "destination confirms only when ITS rider lands")
+bus:pump()                                               -- the done gossips out
+ok(J:live()==nil, "the gossiped done clears the junction's live trip")
+NOW=130000
+bus.nodes["O"]:startTrip("D","Mo"); bus:pump()           -- a fresh trip, then strand it
+NOW=bus.nodes["J"]:live().ts+TRIP_TIMEOUT+1              -- jump past its absolute (ts-anchored) deadline
+ok(bus.nodes["J"]:padPoll(nil)=="idle" and bus.nodes["J"]:live()==nil, "past TRIP_TIMEOUT the trip is no longer live (expiry)")
+
+print("== Phase 17: an ORIGIN that reloads between board and launch still re-launches its rider (CRITICAL fix) ==")
+NOW=140000
+bus.nodes={}
+bus.nodes["O"]=makeNode("O",{c1="D"})
+bus.nodes["D"]=makeNode("D",{c1="O"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["O"]:startTrip("D","Nia"); bus:pump()          -- Nia boards; O opens its launch tube
+ok(bus.nodes["O"].gates.c1==RPM, "origin opened its launch tube on board")
+bus.nodes["O"]:unload(); bus.nodes["O"]:boot(); bus:pump() -- O reboots (e.g. auto-update) before Nia launched
+ok(bus.nodes["O"]:live()~=nil, "origin recovered the trip from disk after the reboot")
+ok((bus.nodes["O"].gates.c1 or 0)==0, "its launch tube is shut right after boot (RAM-wiped gate)")
+bus.nodes["O"]:padPoll("Nia")                            -- Nia is still standing on the origin pad
+ok(bus.nodes["O"].gates.c1==RPM, "origin RE-OPENS the launch tube for Nia -> not stranded on the pad")
+
+print("== Phase 18: a destination that misses its rider (reloaded) leaves the trip live, but NO junction suck-back ==")
+NOW=150000
+bus.nodes={}
+bus.nodes["A"]=makeNode("A",{c1="J"})
+bus.nodes["J"]=makeNode("J",{c1="A",c2="Z"})
+bus.nodes["Z"]=makeNode("Z",{c1="J"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+bus.nodes["A"]:startTrip("Z","Pat"); bus:pump()          -- Pat rides A>J>Z; Z is the destination
+bus.nodes["Z"]:unload()                                  -- Z's chunk is off as Pat is flung to it -> arrival missed
+ok(bus.nodes["J"]:live()~=nil, "the trip stays live (the destination never confirmed it)")
+ok(bus.nodes["J"]:padPoll("Bystander")=="shut" and (bus.nodes["J"].gates.c2 or 0)==0,
+   "a BYSTANDER on the junction pad opens NO gate -> no suck-back from the phantom-live trip")
+NOW=bus.nodes["J"]:live().ts+TRIP_TIMEOUT+1              -- and it self-clears at the absolute deadline
+ok(bus.nodes["J"]:padPoll(nil)=="idle" and bus.nodes["J"]:live()==nil, "the phantom trip ages out at TRIP_TIMEOUT")
 
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end

@@ -162,6 +162,10 @@ lua test/htsim.lua            # simulate the distributed logic incl. chunk unloa
 
 ## Status
 
-Unified self-organizing firmware, deployed and running in-game. Routing, durable map, and the
-chunk-tolerant multi-hop relay are validated by `test/htsim.lua` (23/23). Single-occupancy (one
+Unified self-organizing firmware, deployed and running in-game. Routing, the durable map, and the
+**shared-state trip** — the in-flight trip is gossiped and persisted exactly like the map (merged by a
+`(ts, id)` total order with a monotonic `done` flag), so a junction that reloads mid-route recovers it
+from its own disk or any peer's gossip, **never needing a specific live peer** — are validated by
+`test/htsim.lua` (92/92). Gates are **detector-gated** — a tube opens only while the trip's own rider is
+on the pad — so a reloaded node never opens a gate speculatively (no suck-back). Single-occupancy (one
 trip at a time on the network) by design.

@@ -60,10 +60,13 @@ arrange the tubes so each through-route turns rather than meeting an opposing mo
 - Each node keeps the whole topology: `graph` (node → neighbours) and `gen` (node → last-refresh
   epoch ms). Nodes broadcast their **entire** known map (`STATE`), so one reply hands a newcomer the
   full network. On merge, the newer timestamp wins (a node's own fresh news beats a stale gossiped copy).
-- The map is **persisted to `/ht_graph.dat`** and quiet nodes are **not** forgotten — "quiet" almost
-  always means "chunk unloaded", and a node must be able to route to a stop whose computer is off.
-- `pathTo` is BFS shortest path over the undirected graph. A trip is a `ROUTE` carrying the full
-  `path`; each node opens only the tube toward its next hop; the destination releases.
+- **The trip is shared state too.** The same `STATE` message carries the single network `trip`
+  (`{ id,from,to,path,rider,ts,done }`), saved to `/ht_graph.dat` next to the map. `pathTo` is BFS
+  shortest path; `startTrip` writes the trip and gossips it, and each node `reconcile`s — opening only
+  the tube toward its next hop — to whatever the shared trip says. The destination flips `done = true`.
+- The map (and trip) are **persisted to `/ht_graph.dat`** and quiet nodes are **not** forgotten —
+  "quiet" almost always means "chunk unloaded", and a node must route to (and resume a trip through) a
+  stop whose computer is off.
 
 ### Seed the map once
 
@@ -75,22 +78,29 @@ unloaded.
 ## 4. Chunk-tolerance (why multi-hop works with nodes offline)
 
 A CC computer **stops when its chunk unloads** and **cold-boots (RAM wiped, files kept) when it
-reloads**. So a junction is usually *off* when you launch toward it. The firmware copes:
+reloads**. So a junction is usually *off* when you launch toward it. Because the trip is **shared
+state** (gossiped + persisted), the firmware copes without ever needing a *specific* peer alive:
 
-- routes from the **persisted** map even if no peer is online;
-- on boot it sends **`TRIPREQ`**; any still-loaded node holding the active trip relays it, so the
-  junction that just loaded picks up the trip and opens the right exit;
-- the trip is **re-broadcast every `TRIP_BEAT` s**, so a node loading mid-route catches it within
-  a couple seconds;
-- each node fires its gate **once per trip id** (the `same` guard), and the origin auto-closes its
-  launch tube after `RELAUNCH_HOLD` s, so the relay/beat can't re-grab a rider (no suck-back);
-- the destination confirms with **`ARRIVED`** when its detector sees **the trip's own rider** land
-  (matched by name, so a bystander on the destination pad can't complete someone else's trip); if the
-  rider is never detected, the trip clears on `TRIP_TIMEOUT`.
+- routes — and **resumes a trip** — from the **persisted** map+trip even if every peer is offline. A
+  junction that reloads mid-route reads the trip straight off its own `/ht_graph.dat`;
+- gossips the trip in `STATE`; `adoptTrip` merges it by a **(ts, id) total order** so every node
+  converges on the same trip, and `done` is **monotonic** (once true, never un-done);
+- the trip **ages out at `TRIP_TIMEOUT`** — the absolute deadline AND the finished-marker that blocks a
+  late gossip from resurrecting it. `ts` is fixed per id, so a beat/gossip can never push the deadline;
+- on boot a node restores the trip from disk, then `broadcastState` + `LSREQ` pull the latest trip/`done`
+  from any reachable peer;
+- **gates are DETECTOR-GATED.** A node opens its onward tube only while the trip's **own rider** (by name)
+  is on its pad, and closes it the instant they leave. A gate **never opens speculatively** for a trip
+  whose rider isn't here — so a finished, phantom-live (destination missed the arrival), or resurrected
+  trip can't suck a bystander in, even when a reloaded node can't reach a peer. A reloaded junction still
+  delivers: the rider drops onto its pad and is flung onward. (`RELAUNCH_HOLD` is a brief, trip-scoped
+  cooldown after the rider leaves, so a bounce isn't instantly re-grabbed.)
+- the destination flips the shared trip to `done` only when its detector sees **the trip's own rider**
+  (matched by name, so a bystander can't complete someone else's trip); the `done` then gossips network-wide.
 
-`test/htsim.lua` reproduces exactly this — a trip A→B→C where B and C are unloaded at departure and
-boot as the rider approaches — and asserts the gates, relay, and cleanup behave. Run it after any
-change to routing or the trip/gossip logic.
+`test/htsim.lua` reproduces exactly this — including a junction that **reloads alone with no peer
+reachable** and recovers the trip from its own disk (Phase 14) — and asserts the merge order, expiry,
+suck-back guard, and convergence behave. Run it after any change to routing or the trip/gossip logic.
 
 ## 5. Cross-dimension (Nether / End)
 
@@ -114,11 +124,8 @@ Messages are typed tables; receivers filter by protocol and guard on shape.
 
 | Type | Sent by | Meaning |
 |---|---|---|
-| `STATE{ nodes }` | boot, heartbeat, on `LSREQ` | full gossiped map; `nodes[name] = { nbrs, ts }`. |
-| `LSREQ{}` | boot, warm-up, setup probe | "everyone announce" — each node replies with `STATE`. |
-| `TRIPREQ{}` | boot | "is a trip in progress for me?" — a holder replies with the `ROUTE`. |
-| `ROUTE{ id,from,to,path,rider,ts }` | start / beat / relay | start or relay a trip; each hop opens its next-hop tube once per `id`. |
-| `ARRIVED{ at,id }` | destination on pad-land | end the trip; every node clears its gates. |
+| `STATE{ nodes, trip }` | boot, heartbeat, beat, on `LSREQ` | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }` **and** the single `trip` (`{id,from,to,path,rider,ts,done}` or nil). Receiver merges the map (fresher ts wins) and the trip (`adoptTrip`: (ts,id) order, `done` monotonic). |
+| `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
 | `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA push; `ht_boot` replaces `/firmware.lua` and reboots. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / each node's `log` | version ping / live log line. |
 

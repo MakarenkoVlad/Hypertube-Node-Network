@@ -28,26 +28,37 @@ loop and the distributed protocol.
   (per-node last-refresh epoch). Nodes broadcast their entire known map (`STATE`); one reply hands a
   newcomer the full network. Timestamps make merges safe (fresher wins). The map is **persisted to
   `/ht_graph.dat`** so a node can route even while other nodes' chunks are unloaded.
-- **Routing** is BFS shortest path over the undirected graph (`pathTo`). A trip is a `ROUTE` message
-  carrying the full `path`; each node on the path opens **only** the tube toward the next hop
-  (`applyTrip` -> `gateToward`), and the destination releases.
+- **Routing** is BFS shortest path over the undirected graph (`pathTo`). **The trip is SHARED state**,
+  not a message: `startTrip` writes the single `trip` (`{ id,from,to,path,rider,ts,done }`) and gossips it
+  inside `STATE`; each node `reconcile`s its gate to whatever the shared trip says (junction opens **only**
+  the tube toward its next hop), and the destination flips `trip.done = true`.
 - **A junction is just a node with several tubes.** No separate junction program.
 
 ### Chunk-tolerance is the hard requirement
 
 A CC computer **stops completely when its chunk unloads** and **cold-boots (RAM wiped, files persist)
-when it reloads**. So you cannot assume any other node is running. The design copes by:
+when it reloads**. So you cannot assume any other node is running. **The whole point of making the trip
+shared state is this:** a reloaded node learns the trip from its OWN disk or ANY peer's gossip — never
+from one specific live peer (the user's requirement: "peers might be offloaded"). The design copes by:
 
-- persisting the map to disk (route without peers online);
-- on boot, broadcasting `TRIPREQ` so a still-loaded peer relays any in-progress trip to the node that
-  just woke up (a junction that loads as the rider approaches catches the trip);
-- re-broadcasting the active trip every `TRIP_BEAT` seconds;
-- firing each node's gate **once per trip id** (the `same` guard in `handle`) so the beat/relay can't
-  re-grab a rider (suck-back); the origin auto-closes its launch tube after `RELAUNCH_HOLD`.
+- persisting the **map AND the trip** to `/ht_graph.dat` (one shared-state file), so a node routes — and
+  resumes a trip — from disk even with every peer unloaded;
+- gossiping the trip in `STATE`; `adoptTrip` merges by a **(ts, id) total order** so every node converges
+  on the same trip, with `done` **monotonic** (sticky-true) so a finished trip can't be un-finished;
+- the trip **ages out at `TRIP_TIMEOUT`** (acting as the absolute deadline AND the finished-marker that
+  blocks a late gossip from resurrecting it); `ts` is fixed per id, so beats/gossip can never push it;
+- on boot, `loadGraph` restores the trip, then `broadcastState` + `LSREQ` converge the latest trip/`done`
+  from peers;
+- **gates are DETECTOR-GATED.** A node opens its onward tube only while the trip's **own rider** (by name)
+  is on its pad (the pad poll), and closes it the moment they leave. So a gate **never opens speculatively**
+  for a trip whose rider isn't physically here — no suck-back from a finished, phantom-live (destination
+  missed the arrival), or resurrected trip, even when a reloaded node can't reach a peer. A reloaded
+  junction still delivers: the rider drops onto its pad and is flung onward. (`RELAUNCH_HOLD` is a brief,
+  trip-id-scoped cooldown after a rider leaves, so a bounce isn't instantly re-grabbed.)
 
-This is the property `test/htsim.lua` exists to protect — it models unload/reload and a trip relayed
-onto nodes that boot mid-route. **Run it after any change to routing, the trip state machine, or the
-gossip/merge logic.**
+This is the property `test/htsim.lua` exists to protect — it models unload/reload and a junction that
+**reloads alone with no peer reachable** yet recovers the trip from its own disk (Phase 14). **Run it
+after any change to routing, the trip merge/expiry, or the gossip logic.**
 
 ## Hard constraints (do not violate)
 
@@ -87,13 +98,14 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 
 | Type | Sent by | Meaning |
 |---|---|---|
-| `STATE{ nodes }` | `broadcastState` (boot, heartbeat, on `LSREQ`) | full gossiped map; `nodes[name] = { nbrs, ts }`. |
-| `LSREQ{}` | boot, warm-up, `probeNetwork` | "everyone announce" — each node replies with `STATE`. |
-| `TRIPREQ{}` | boot | "is a trip in progress for me?" — a holder replies with the `ROUTE`. |
-| `ROUTE{ id,from,to,path,rider,ts }` | `startTrip`, beat, relay | start/relay a trip; each hop opens its next-hop tube once per `id`. |
-| `ARRIVED{ at,id }` | destination on pad-land | end the trip; every node clears. |
+| `STATE{ nodes, trip }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }` AND the single `trip` (`{id,from,to,path,rider,ts,done}` or nil). Receiver merges the map (fresher ts wins) and the trip (`adoptTrip`: (ts,id) order, `done` monotonic). |
+| `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
 | `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA firmware push; `ht_boot` swaps `/firmware.lua` and reboots. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / every node's `log` | version ping / live log line. |
+
+> **The trip is shared state, not a message.** `startTrip` and arrival are just writes to `trip` that
+> gossip via `STATE`; there are **no** `ROUTE`/`ARRIVED`/`TRIPREQ` messages (a reloaded node would lose
+> them if no peer were live). Don't reintroduce point-to-point trip messages — put trip data in `STATE`.
 
 > **OTA keeps config because config is a separate file.** In this unified model `/ht_node.cfg` is
 > independent of `/firmware.lua`, so an update is a whole-file replace — there are no in-firmware
@@ -129,8 +141,9 @@ push.sh                   git add/commit/push helper; prints the node update com
   override block, and the `report`/README key list.
 - **Debugging:** `firmware.lua report` dumps a full snapshot to `/ht_report.txt` (config, peripherals,
   persisted map, tunables, recent `/ht.log`); `htlog` tees the network trace to `/htlog.txt`. Both are
-  meant to be `pastebin put` and shared. Per-node files now: `/ht_node.cfg`, `/ht_graph.dat`,
-  `/ht_tune.cfg`, `/ht.log`, `/ht_report.txt` (and `/firmware.lua`, `/startup`, optional `/ht_group`).
+  meant to be `pastebin put` and shared. Per-node files now: `/ht_node.cfg`, `/ht_graph.dat` (map **+ the
+  shared trip**), `/ht_tune.cfg`, `/ht.log`, `/ht_report.txt` (and `/firmware.lua`, `/startup`, optional
+  `/ht_group`).
 - **Bump `VERSION`** (e.g. `v12` -> `v13`) on every firmware change. It's shown on the monitor and
   printed/logged on boot — it's how you confirm in-game that an OTA push actually landed.
 - **rednet messages** are typed tables; filter by protocol; never trust shape (`type(x)=="table"` guards).
@@ -148,7 +161,7 @@ push.sh                   git add/commit/push helper; prints the node update com
 
 ```bash
 luacheck src/                 # static analysis; if missing: brew install luacheck
-lua test/htsim.lua            # MUST print "59 passed, 0 failed" (or update the count with intent)
+lua test/htsim.lua            # MUST print "92 passed, 0 failed" (or update the count with intent)
 ```
 
 A no-luacheck fallback full-parse: `lua -e "assert(loadfile('src/ht_node.lua'))"`. The firmware can't

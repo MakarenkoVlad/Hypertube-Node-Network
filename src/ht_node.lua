@@ -23,7 +23,7 @@ local RPM           = 128
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
 local TRIP_TIMEOUT  = 30     -- seconds after a trip STARTS that it auto-clears (anchored to trip.ts)
 local TRIP_BEAT     = 2      -- s: re-broadcast the active trip so a node that just loaded catches it
-local RELAUNCH_HOLD = 3      -- s a junction/origin keeps its exit spinning after launching the rider
+local RELAUNCH_HOLD = 3      -- s cooldown after a rider leaves our pad before we'd re-open the SAME trip's tube (anti-bounce)
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
 local GRAPHFILE    = "/ht_graph.dat"  -- durable copy of the network map (survives reboot / chunk unload)
 local PROTO        = "hypertube"
@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v23"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v25"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -371,6 +371,18 @@ if args[1] == "report" then       -- write a full diagnostic snapshot to a file 
     else add("  (unreadable)") end
   else add("  (no map yet - this node hasn't learned the network)") end
   add("")
+  add("[shared trip in " .. GRAPHFILE .. "]  (the single network trip, gossiped + persisted)")
+  local stf = fs.exists(GRAPHFILE) and fs.open(GRAPHFILE, "r") or nil
+  local st = stf and textutils.unserialize(stf.readAll() or "") or nil
+  if stf then stf.close() end
+  if type(st) == "table" and type(st.trip) == "table" then
+    local t = st.trip
+    local ageS = math.floor((now() - (tonumber(t.ts) or now())) / 1000)
+    add(("  to=%s rider=%s done=%s id=%s"):format(tostring(t.to), tostring(t.rider), tostring(t.done), tostring(t.id)))
+    add("  path: " .. table.concat(t.path or {}, " > "))
+    add(("  age=%ss  (expires at %ss past start)"):format(ageS, TRIP_TIMEOUT))
+  else add("  (none - no trip on record here)") end
+  add("")
   add("[recent log " .. LOGFILE .. "]  (last 40 lines)")
   local lf = fs.exists(LOGFILE) and fs.open(LOGFILE, "r") or nil
   if lf then
@@ -437,16 +449,39 @@ end
 local graph = { [NAME] = myNeighbours() }    -- node -> { neighbour, ... }
 local gen   = { [NAME] = now() }             -- node -> last-refresh epoch (ms)
 
+-- The single network trip is SHARED state, exactly like the map: it rides in STATE and is saved to disk
+-- alongside the graph, so a node that reloads mid-route recovers it from its OWN disk or ANY peer's gossip -
+-- never from one specific live peer that might be unloaded. `trip` = { id,from,to,path,rider,ts,done }.
+-- Single-occupancy: a newer `ts` supersedes; `done` is MONOTONIC (once true, stays true). The trip ages out
+-- at TRIP_TIMEOUT - serving as the absolute deadline AND the finished-marker, so a late gossip can't
+-- resurrect it. `ts` is fixed per id (the id embeds it), so beats can never push the deadline back.
+local trip = nil
+local function tripExpired(t) return (not t) or (now() - (tonumber(t.ts) or 0)) > TRIP_TIMEOUT * 1000 end
+local function live() if trip and not trip.done and not tripExpired(trip) then return trip end end
+local function adoptTrip(t)                   -- merge a gossiped/started trip into our shared copy; true if changed
+  if type(t) ~= "table" or not t.id or type(t.path) ~= "table" or tripExpired(t) then return false end
+  if not trip then trip = t
+  elseif t.id == trip.id then
+    if t.done and not trip.done then trip.done = true else return false end  -- done is sticky
+  else
+    -- a NEWER trip supersedes. Order by (ts, id): a strict total order, so EVERY node converges on the same
+    -- winner even when two trips share a millisecond (id breaks the tie deterministically - no divergence).
+    local tts, cts = tonumber(t.ts) or 0, tonumber(trip.ts) or 0
+    if tts > cts or (tts == cts and t.id > trip.id) then trip = t else return false end
+  end
+  return true
+end
+
 local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComputerLabel(NAME) end end
 
 -- Durable topology. Persist the whole map so this node can route even when other
 -- nodes are unloaded (their computers are off). We do NOT forget a quiet node -
 -- quiet almost always means "chunk unloaded", not "removed" (use `forget` to drop
 -- the map deliberately). Timestamps still keep live merges correct (fresher wins).
-local function saveGraph()
+local function saveGraph()                    -- persist the whole shared state: map + the in-flight trip
   pcall(function()
     local f = fs.open(GRAPHFILE, "w")
-    if f then f.write(textutils.serialize({ graph = graph, gen = gen })); f.close() end
+    if f then f.write(textutils.serialize({ graph = graph, gen = gen, trip = trip })); f.close() end
   end)
 end
 local function loadGraph()
@@ -460,31 +495,37 @@ local function loadGraph()
         end
       end
     end
+    if type(d) == "table" and type(d.trip) == "table" and not tripExpired(d.trip) then
+      trip = d.trip                                        -- recover the in-flight trip we last knew (reboot-survivable)
+    end
   end)
 end
-loadGraph()   -- begin from the last-known topology, so routing works before anyone announces
+loadGraph()   -- begin from the last-known topology AND trip, so we route (and resume) before anyone announces
 
--- refresh our own row, then gossip the ENTIRE known map
+-- refresh our own row, then gossip the ENTIRE known map AND the current trip (the whole shared state)
 local function broadcastState()
   graph[NAME] = myNeighbours(); gen[NAME] = now()
   saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
-  bcast({ type = "STATE", nodes = nodes })
+  bcast({ type = "STATE", nodes = nodes, trip = trip })
 end
 
--- merge a gossiped map; per node, keep the newer timestamp. true if anything changed.
-local function mergeState(nodes)
-  if type(nodes) ~= "table" then return false end
-  local changed = false
-  for n, info in pairs(nodes) do
-    if type(info) == "table" and type(info.nbrs) == "table" then
-      local ts = tonumber(info.ts) or 0
-      if not gen[n] or ts > gen[n] then graph[n] = info.nbrs; gen[n] = ts; changed = true end
+-- merge a gossiped map + trip. Returns (mapChanged, tripChanged); per node keep the newer timestamp,
+-- and adoptTrip applies the single-occupancy / done-monotonic merge for the shared trip.
+local function mergeState(nodes, gtrip)
+  local mapChanged = false
+  if type(nodes) == "table" then
+    for n, info in pairs(nodes) do
+      if type(info) == "table" and type(info.nbrs) == "table" then
+        local ts = tonumber(info.ts) or 0
+        if not gen[n] or ts > gen[n] then graph[n] = info.nbrs; gen[n] = ts; mapChanged = true end
+      end
     end
   end
-  if changed then saveGraph() end
-  return changed
+  local tripChanged = gtrip ~= nil and adoptTrip(gtrip)
+  if mapChanged or tripChanged then saveGraph() end
+  return mapChanged, tripChanged
 end
 
 -- shortest path NAME..dest over the (undirected) graph; nil if unreachable
@@ -565,43 +606,41 @@ local function gateToward(nb)                  -- spin only the owned tube to nb
 end
 local function allStop() gateToward(nil) end
 
--- ---- trip state ----------------------------------------------------------
--- `active` is the trip currently moving someone. `tripDeadline` is an ABSOLUTE
--- wall-clock time (anchored to the trip's start), so periodic re-broadcasts
--- (beats) can NEVER push it back and livelock the timeout. `done` remembers
--- recently-finished trip ids so a late beat can't resurrect a cleared trip.
-local active, relaunchStop, tripDeadline = nil, nil, nil
-local done = {}                               -- trip id -> epoch ms after which we forget it
-local hintRef = { text = nil }                -- set by applyTrip's callers; read by refresh
-
-local function markDone(id) if id then done[id] = now() + TRIP_TIMEOUT * 1000 end end
-local function pruneDone() local t = now(); for id, exp in pairs(done) do if t > exp then done[id] = nil end end end
+-- ---- trip gate logic -----------------------------------------------------
+-- The trip is SHARED state (declared up top). Gates are DETECTOR-GATED: a node opens its onward tube ONLY
+-- while the trip's OWN rider is on its pad (the pad poll), and closes it when they leave. So a gate never
+-- opens speculatively for a trip whose rider isn't physically here - no suck-back from a finished/phantom/
+-- resurrected trip, and a reloaded junction still delivers (the rider drops onto its pad and is flung on).
+local relaunchStop = nil                       -- after a rider leaves our pad, a short cooldown timer so a
+local relaunchStopFor = nil                    -- bounce can't be re-grabbed instantly. Tied to the trip id
+                                               -- (relaunchStopFor) so a stale cooldown can't block a LATER trip.
+local opened = false                           -- is OUR onward tube currently open for the live trip?
+local hintRef = { text = nil }                 -- set by reconcile; read by refresh
 
 local function indexIn(path) for i, n in ipairs(path) do if n == NAME then return i end end end
 
--- set this node's gate for a trip and return a human hint for our screen
-local function applyTrip(t)
-  relaunchStop = nil                           -- a new trip supersedes any prior origin auto-close timer
+-- screen hint for a trip `t` (no gate side-effects - the pad poll/reconcile drive the gate)
+local function tripHint(t)
   local i = indexIn(t.path)
-  if not i then allStop(); return nil end      -- we're not on this path
-  if i == #t.path then allStop(); return ("Arrived: %s"):format(t.rider or "traveller") end
+  if not i then return nil end
+  if i == #t.path then return ("Arrived: %s"):format(t.rider or "traveller") end
   local nxt = t.path[i + 1]
-  if not controllerToward(nxt) then            -- portal hop: no tube/controller here
-    allStop(); return ("Walk through the portal to %s"):format(nxt)
-  end
-  gateToward(nxt)                              -- open the through-tube and KEEP it open: a 90-deg
-                                               -- junction passes the rider, and one who stops at the
-                                               -- open mouth is pulled onward too.
-  if i == 1 then                               -- origin: auto-close shortly after launch so a rider
-    relaunchStop = os.startTimer(RELAUNCH_HOLD) -- who bounces back can't be instantly re-grabbed
-    return ("Board -> %s"):format(t.to)
-  end
+  if not controllerToward(nxt) then return ("Walk through the portal to %s"):format(nxt) end
+  if i == 1 then return ("Board -> %s"):format(t.to) end
   return ("Pass through -> %s"):format(t.to)
 end
 
-local function setActive(t)
-  active = t
-  tripDeadline = (tonumber(t.ts) or now()) + TRIP_TIMEOUT * 1000   -- absolute; immune to beats
+-- Close our gate when we are NOT an active tube-hop for the current trip (no live trip, off-path, the
+-- destination, or a portal hop). For an origin/junction tube-hop the PAD POLL owns open/close by detector,
+-- so reconcile leaves that gate alone (no flicker on every beat). Always refreshes the screen hint.
+local function reconcile()
+  local t = live()
+  if not t then hintRef.text = nil; if opened then allStop(); opened = false end; return end
+  hintRef.text = tripHint(t)
+  local i = indexIn(t.path)
+  if (not i) or i == #t.path or not controllerToward(t.path[i + 1]) then  -- off-path / destination / portal
+    if opened then allStop(); opened = false end
+  end
 end
 
 -- ---- player presence -----------------------------------------------------
@@ -710,7 +749,7 @@ local function drawList(status, color)
   for idx = scroll + 1, math.min(#dests, scroll + capacity) do
     local d = dests[idx]
     local tag = (d.dist <= 1) and "direct" or (d.dist .. " hops")
-    mon.setCursorPos(1, y); mon.setBackgroundColor(active and colors.gray or colors.green); mon.setTextColor(colors.white)
+    mon.setCursorPos(1, y); mon.setBackgroundColor(live() and colors.gray or colors.green); mon.setTextColor(colors.white)
     local left = (" " .. d.name .. string.rep(" ", w)):sub(1, math.max(1, w - #tag - 1))
     mon.write((left .. tag .. " "):sub(1, w))
     rowDest[y] = d.name
@@ -740,7 +779,8 @@ end
 
 local function refresh()
   if kbOpen then draw(); return end                  -- the filter keyboard owns the screen while open
-  if active then draw(hintRef.text or ("Net: " .. (active.rider or "?") .. " -> " .. active.to), colors.orange)
+  local t = live()
+  if t then draw(hintRef.text or ("Net: " .. (t.rider or "?") .. " -> " .. t.to), colors.orange)
   elseif detector then
     local who = riderOnPad()
     if who then draw("Welcome, " .. who .. " - tap a destination", colors.lime)
@@ -762,78 +802,75 @@ local function pokeMonitor()
 end
 
 -- ---- trips ---------------------------------------------------------------
--- end the current trip and remember its id, so a late beat can't resurrect it
-local function endTrip(reason)
-  if active then markDone(active.id) end
-  active, hintRef.text, tripDeadline, relaunchStop = nil, nil, nil, nil  -- cancel any pending auto-close
-  allStop(); refresh()
+-- A trip is just a write to the SHARED state: starting one publishes a new trip; arriving marks it `done`.
+-- Both are persisted (saveGraph) and gossiped (broadcastState), so every node - live now or reloading later -
+-- converges from shared state. There are no point-to-point ROUTE/ARRIVED/TRIPREQ messages to lose.
+local lastTripLogged = nil
+
+-- DESTINATION confirms arrival: flip the shared trip to done + gossip it, so the whole network (and any node
+-- that reloads later and asks for state) sees it finished and won't re-open a gate for it (no suck-back).
+local function arrive(reason)
+  if trip then trip.done = true; saveGraph(); broadcastState() end
+  relaunchStop = nil
+  if opened then allStop(); opened = false end
+  reconcile(); refresh()
   if reason then log(reason) end
 end
 
 local function startTrip(dest)
   if dest == NAME then return end
-  pruneDone()
-  -- debounce accidental double-taps, but DON'T hard-lock: re-tapping re-routes
-  if active and (now() - (active.ts or 0)) < 1500 then return end
+  if live() and (now() - (trip.ts or 0)) < 1500 then return end   -- debounce double-taps; re-tap still re-routes
   local path = pathTo(dest)
   if not path then draw("No route to " .. dest, colors.red); return end
   local rider = riderOnPad()
   if detector and not rider then draw("Step onto the pad first", colors.orange); return end
-  local t = { type = "ROUTE", id = NAME .. ":" .. now(), from = NAME, to = dest, path = path, rider = rider, ts = now() }
-  bcast(t)                                   -- tell every hop on the path to open its gate FIRST
+  local ts = math.max(now(), (trip and tonumber(trip.ts) or 0) + 1)   -- strictly newer so adoptTrip can't reject ours
+  if not adoptTrip({ id = NAME .. ":" .. ts, from = NAME, to = dest, path = path, rider = rider, ts = ts, done = false }) then
+    refresh(); return                          -- couldn't become the shared trip (shouldn't happen with a forced ts)
+  end
+  relaunchStop = nil; lastTripLogged = trip.id
+  saveGraph(); broadcastState()               -- publish the new trip as shared state to every node
   log("start -> " .. dest .. " via " .. table.concat(path, ">") .. (rider and (" (" .. rider .. ")") or ""))
-  setActive(t); hintRef.text = applyTrip(t); refresh()   -- launch from our pad; junctions catch & relaunch
+  gateToward(path[2]); opened = true           -- fling the rider off our pad NOW; the pad poll closes it once they leave
+  hintRef.text = ("Board -> %s"):format(dest); refresh()
 end
 
 local function handle(msg)
   if type(msg) ~= "table" then return end
   if msg.type == "STATE" then
-    if mergeState(msg.nodes) and not active then refresh() end
-  elseif msg.type == "LS" and msg.name then            -- legacy single-node announce (transition)
-    graph[msg.name] = msg.neighbours or {}; gen[msg.name] = now()
-    if not active then refresh() end
+    local mapChanged, tripChanged = mergeState(msg.nodes, msg.trip)
+    if tripChanged then
+      reconcile()
+      local t = live()
+      if t and t.id ~= lastTripLogged and indexIn(t.path) then   -- a NEW live trip reached us: note our role once
+        lastTripLogged = t.id
+        log("trip " .. (t.to or "?") .. " : " .. (hintRef.text or "?"))
+      end
+    end
+    if (mapChanged or tripChanged) and not live() then refresh() end
   elseif msg.type == "LSREQ" then
-    broadcastState()
-  elseif msg.type == "TRIPREQ" then
-    if active then bcast(active) end    -- relay an in-progress trip to a node that just (re)loaded
-  elseif msg.type == "ROUTE" and msg.path and msg.id then
-    pruneDone()
-    if done[msg.id] then return end     -- a trip we've already finished: ignore late/resurrecting beats
-    if active and active.id == msg.id then
-      active = msg                      -- same trip: keep it alive, but DON'T reset the deadline
-      return                            -- (absolute deadline) and DON'T re-fire the gate (no suck-back)
-    end
-    setActive(msg)                      -- a trip we haven't seen: pick it up and open our gate
-    hintRef.text = applyTrip(msg); refresh()
-    if hintRef.text then log("route " .. (msg.to or "?") .. " : " .. hintRef.text) end
-  elseif msg.type == "ARRIVED" then
-    markDone(msg.id)                    -- record it done even if we weren't holding it
-    if active and (msg.id == nil or active.id == msg.id) then
-      endTrip("arrived at " .. (msg.at or "?") .. " - trip done")
-    else
-      log("arrived at " .. (msg.at or "?") .. " - trip done")
-    end
+    broadcastState()                           -- "send me the shared state" - reply carries map AND trip
   end
 end
 
 -- ---- boot ----------------------------------------------------------------
--- NOTE: trip state is deliberately RAM-only (not persisted). A node that reloads
--- boots with NO active trip and waits for a fresh ROUTE/beat; a still-loaded peer
--- relays an in-progress trip to it on TRIPREQ. This avoids re-opening a gate for a
--- trip that already finished while we were unloaded (a suck-back hazard). The
--- network MAP is persisted (GRAPHFILE); the trip is not.
+-- The whole shared state - map AND the in-flight trip - is persisted to GRAPHFILE, so a node that reloads
+-- mid-route already knows the trip from its own disk (loadGraph ran at startup). We then ask the network
+-- for the latest shared state (LSREQ -> peers reply STATE with map+trip), which is also how a finished
+-- `done` reaches us. Gates are detector-gated, so a restored trip opens NO tube until its rider is actually
+-- on our pad - a trip that finished while we were unloaded can never re-open a gate (no suck-back).
 setNameLabel()
 allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(monName or false)))
 if #monAll > 1 then log(("note: %d monitors - drawing to %s (pin with: firmware.lua monitor)"):format(#monAll, tostring(monName))) end
 if sharedWarn then log("WARNING: >1 detector - several nodes may share one wired network (firmware.lua diag)") end
+if live() then log("restored trip -> " .. (trip.to or "?") .. " from shared state") end
 pokeMonitor()                   -- un-stick a stale monitor frame (re-render) before drawing
 refresh()                       -- draw the screen FIRST, before any networking, so the monitor
                                 -- always shows current state even if this node has no modem
 if not netUp then print("[warn] no modem - this node can't see the network.") end
-broadcastState()
-bcast({ type = "LSREQ" })       -- ask everyone to announce
-bcast({ type = "TRIPREQ" })     -- on (re)load, catch up on any trip already in progress
+broadcastState()                -- gossip our state (map + any trip we restored) to everyone
+bcast({ type = "LSREQ" })       -- ...and ask everyone for theirs (their reply carries map AND the latest trip/done)
 local lsTimer   = os.startTimer(LS_INTERVAL)
 local padTimer  = os.startTimer(1)
 local beatTimer = os.startTimer(TRIP_BEAT)
@@ -879,24 +916,34 @@ while true do
     elseif e[2] == warmTimer then
       if warm > 0 then
         warm = warm - 1
-        bcast({ type = "LSREQ" }); broadcastState()
+        bcast({ type = "LSREQ" }); broadcastState()   -- converge the shared state (map + trip) fast after boot
         warmTimer = os.startTimer(0.5)
       end
     elseif e[2] == relaunchStop then
-      relaunchStop = nil
-      if active then allStop() end   -- close our launch exit so a bounce can't re-grab the rider
+      relaunchStop = nil   -- launch cooldown over; the pad poll may open again if the rider is (still) on the pad
     elseif e[2] == beatTimer then
-      if active then bcast(active) end   -- keep relaying so nodes loading mid-route catch it
+      if live() then broadcastState() end   -- re-gossip the shared trip so a node loading mid-route converges
       beatTimer = os.startTimer(TRIP_BEAT)
     elseif e[2] == padTimer then
-      if active and tripDeadline and now() > tripDeadline then
-        endTrip("trip timed out - clearing")                  -- absolute deadline backstop
-      elseif active and active.to == NAME and onPad(active.rider) then
-        bcast({ type = "ARRIVED", at = NAME, id = active.id }) -- DESTINATION sees OUR rider land: confirm
-        endTrip("arrived: " .. (active.rider or "traveller"))
-      elseif not active then refresh() end
-      -- poll faster while we're the active destination so a quick rider isn't missed
-      padTimer = os.startTimer((active and active.to == NAME) and 0.4 or 1)
+      local t = live()
+      local i = t and indexIn(t.path)
+      local arrived = false
+      if not t or not i then
+        if trip and tripExpired(trip) then trip = nil; saveGraph() end  -- drop the long-finished trip from disk
+        if opened then allStop(); opened = false end                    -- not on a live path -> nothing to hold open
+      elseif i == #t.path then                                          -- DESTINATION: confirm when OUR rider lands
+        if onPad(t.rider) then arrive("arrived: " .. (t.rider or "traveller")); arrived = true
+        elseif opened then allStop(); opened = false end
+      elseif controllerToward(t.path[i + 1]) then                       -- ORIGIN / JUNCTION tube-hop: DETECTOR-gated
+        if onPad(t.rider) and not (relaunchStop and relaunchStopFor == t.id) then  -- rider here, no SAME-trip cooldown
+          if not opened then gateToward(t.path[i + 1]); opened = true end          -- -> open the onward tube
+        elseif opened and not onPad(t.rider) then                       -- they've been flung onward -> close + cooldown
+          allStop(); opened = false
+          relaunchStop = os.startTimer(RELAUNCH_HOLD); relaunchStopFor = t.id
+        end
+      end
+      if not arrived then refresh() end   -- keep the monitor live (arrive already refreshed)
+      padTimer = os.startTimer(live() and 0.4 or 1)
     end
   end
 end
