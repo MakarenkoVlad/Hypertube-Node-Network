@@ -128,6 +128,7 @@ cross-dimension ender-modem network — resumes it. Covered by `test/htsim.lua` 
 | `firmware.lua monitor` | When the node has several monitors, pick which screen is its menu (labels each, you choose; pinned in config). |
 | `firmware.lua reset` | Wipe config + learned map, reboot into fresh setup. |
 | `firmware.lua forget` | Drop only the learned map (re-learn topology); keep name + tubes. |
+| `firmware.lua forget <name>` | **Remove a node from the whole network** (a renamed/decommissioned station). Writes a durable, gossiped tombstone — run once from any node and the name disappears everywhere and stays gone across reloads. Harmless if the node is still alive (it un-removes itself). |
 | `firmware.lua log` | Print this node's local event log. |
 | `firmware.lua report` | Write a full diagnostic snapshot to `/ht_report.txt` (config, peripherals, map, recent log). |
 | `firmware.lua set <KEY> <n>` | Tweak a tunable in-game — persists in `/ht_tune.cfg`, survives OTA, reboots to apply. |
@@ -176,7 +177,7 @@ Unified self-organizing firmware, deployed and running in-game. Routing, the dur
 **shared-state trip** — the in-flight trip is gossiped and persisted exactly like the map (merged by a
 `(ts, id)` total order with a monotonic `done` flag), so a junction that reloads mid-route recovers it
 from its own disk or any peer's gossip, **never needing a specific live peer** — are validated by
-`test/htsim.lua` (125/125). A **junction opens its tube in advance (fly-through)** so a moving rider sails
+`test/htsim.lua` (133/133). A **junction opens its tube in advance (fly-through)** so a moving rider sails
 through, while the **origin** is detector-gated (re-launches you after a reload) and the **destination**
 confirms arrival by your name. **Cross-dimension portals** use nameless **portal mouths** that bridge two
 real stations and spin their tube only while a trip is crossing. Single-occupancy (one trip at a time) by design.

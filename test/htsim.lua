@@ -10,6 +10,7 @@ local RPM = 128
 local TRIP_TIMEOUT = 30
 local RELAUNCH_HOLD = 3        -- matches the firmware tunable (launch cooldown)
 local DEST_TTL = 300          -- matches the firmware: how long a remembered rider->dest lives
+local TOMB_TTL = 2592000      -- matches the firmware: how long a node-removal tombstone lives
 local NOW = 1000
 local function dc(t) if type(t)~="table" then return t end local r={} for k,v in pairs(t) do r[k]=dc(v) end return r end
 local function tripExpired(t) return (not t) or (NOW-(tonumber(t.ts) or 0))>TRIP_TIMEOUT end
@@ -33,7 +34,7 @@ local function makeNode(name, links, portals, bridge)
   -- the map (self.files.state). Single-occupancy: newer ts supersedes; `done` monotonic; ages out at
   -- TRIP_TIMEOUT. No ROUTE/ARRIVED/TRIPREQ - a node converges on the trip from gossip or its own disk.
   local nd = { NAME=name, LINKS=links, PORTALS=portals or {}, files={}, graph={}, gen={}, trip=nil,
-               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false, riderDest={}, bridge=bridge }
+               gates={}, loaded=false, tripSeq=0, relaunchStop=nil, opened=false, riderDest={}, tombs={}, bridge=bridge }
   function nd:myNeighbours()
     local s,o={},{}
     for _,nb in pairs(self.LINKS) do if not s[nb] then s[nb]=true; o[#o+1]=nb end end
@@ -62,8 +63,20 @@ local function makeNode(name, links, portals, bridge)
     if not cur or (tonumber(d.ts) or 0)>(tonumber(cur.ts) or 0) then self.riderDest[rn]={to=d.to, ts=d.ts}; return true end
     return false
   end
+  -- ---- tombstones (durable node removal; mirror firmware) ----
+  function nd:mergeTomb(nm, ts)
+    ts=tonumber(ts) or 0
+    if type(nm)~="string" or nm==self.NAME or ts==0 then return false end  -- never tombstone ourselves
+    if not self.tombs[nm] or ts>self.tombs[nm] then self.tombs[nm]=ts; return true end
+    return false
+  end
+  function nd:pruneTombs() for nm,ts in pairs(self.tombs) do if NOW-(tonumber(ts) or 0)>TOMB_TTL then self.tombs[nm]=nil end end end
+  function nd:applyTombs() for nm,ts in pairs(self.tombs) do if nm~=self.NAME and self.gen[nm] and self.gen[nm]<=ts then self.graph[nm]=nil; self.gen[nm]=nil end end end
+  function nd:removeNode(nm)  -- the `firmware.lua forget <name>` path: tombstone + drop locally, then gossip the removal
+    self.tombs[nm]=NOW; self.graph[nm]=nil; self.gen[nm]=nil; self:saveGraph(); self:broadcastState()
+  end
   -- ---- shared state persist + gossip ----
-  function nd:saveGraph() self.files.state={ graph=dc(self.graph), gen=dc(self.gen), trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest) } end
+  function nd:saveGraph() self.files.state={ graph=dc(self.graph), gen=dc(self.gen), trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest), tombs=dc(self.tombs) } end
   function nd:loadGraph()
     local d=self.files.state
     if d and d.graph then for n,nbrs in pairs(d.graph) do
@@ -71,19 +84,26 @@ local function makeNode(name, links, portals, bridge)
     end end
     if d and type(d.trip)=="table" and not tripExpired(d.trip) then self.trip=dc(d.trip) end
     if d and type(d.dests)=="table" then for nm,dd in pairs(d.dests) do if type(dd)=="table" then self.riderDest[nm]=dc(dd) end end self:pruneDests() end
+    if d and type(d.tombs)=="table" then for nm,ts in pairs(d.tombs) do if type(ts)=="number" then self.tombs[nm]=ts end end self:pruneTombs(); self:applyTombs() end
   end
   function nd:broadcastState()
     if not self.bridge then self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW end  -- a mouth advertises no row
-    self:saveGraph(); self:pruneDests()
+    self:pruneTombs(); self:applyTombs(); self:saveGraph(); self:pruneDests()
     local nodes={} for n,nbrs in pairs(self.graph) do nodes[n]={nbrs=nbrs, ts=self.gen[n] or 0} end
-    bus:broadcast(self.NAME, { type="STATE", nodes=nodes, trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest) })
+    bus:broadcast(self.NAME, { type="STATE", nodes=nodes, trip=self.trip and dc(self.trip) or nil, dests=dc(self.riderDest), tombs=dc(self.tombs) })
   end
-  function nd:mergeState(nodes, gtrip, gdests)
+  function nd:mergeState(nodes, gtrip, gdests, gtombs)
     local mc=false
+    if type(gtombs)=="table" then for nm,ts in pairs(gtombs) do if self:mergeTomb(nm,ts) then mc=true end end end  -- removals first
     if type(nodes)=="table" then for n,info in pairs(nodes) do if type(info)=="table" and type(info.nbrs)=="table" then
       local ts=info.ts or 0
-      if not self.gen[n] or ts>self.gen[n] then self.graph[n]=dc(info.nbrs); self.gen[n]=ts; mc=true end
+      if self.tombs[n] and ts<=self.tombs[n] then  -- a row older than its removal: ignore it
+      elseif not self.gen[n] or ts>self.gen[n] then
+        self.graph[n]=dc(info.nbrs); self.gen[n]=ts; mc=true
+        if self.tombs[n] then self.tombs[n]=nil end  -- a row newer than the tomb: node is back -> un-remove
+      end
     end end end
+    self:applyTombs()
     local tc = gtrip~=nil and self:adoptTrip(gtrip)
     local dch=false
     if type(gdests)=="table" then for nm,dd in pairs(gdests) do if self:mergeDest(nm,dd) then dch=true end end end
@@ -163,13 +183,13 @@ local function makeNode(name, links, portals, bridge)
   function nd:handle(msg)
     if type(msg)~="table" then return end
     if msg.type=="STATE" then
-      local _,tc=self:mergeState(msg.nodes, msg.trip, msg.dests)
+      local _,tc=self:mergeState(msg.nodes, msg.trip, msg.dests, msg.tombs)
       if tc then if self.bridge then self:mouthGate() else self:reconcile() end end
     elseif msg.type=="LSREQ" then self:broadcastState() end
   end
   function nd:beat() if self:live() then self:broadcastState() end end  -- re-gossip the shared trip
   function nd:boot()
-    self.loaded=true; self.graph={}; self.gen={}; self.trip=nil; self.gates={}; self.riderDest={}
+    self.loaded=true; self.graph={}; self.gen={}; self.trip=nil; self.gates={}; self.riderDest={}; self.tombs={}
     self.relaunchStop=nil; self.opened=false; self.lastHint=nil
     if not self.bridge then self.graph[self.NAME]=self:myNeighbours(); self.gen[self.NAME]=NOW end  -- a mouth seeds no row
     self:loadGraph()                                       -- recover map AND trip from disk
@@ -652,6 +672,37 @@ for _,nd in pairs(bus.nodes) do nd:unload() end                      -- the mout
 NOW=NOW+2; bus.nodes["Cm"]:boot(); bus:pump()                        -- reloads ALONE: no peer answers
 ok(bus.nodes["Cm"]:live()~=nil, "reloaded mouth recovered the live crossing from its OWN disk (no peer)")
 ok(bus.nodes["Cm"].gates.m1==RPM, "...and re-opened its tube so the crossing rider isn't stranded")
+
+print("== Phase 25: a TOMBSTONE removes a renamed/dead node network-wide and survives reload (programmatic cleanup) ==")
+NOW=220000
+bus.nodes={}
+bus.nodes["A"]=makeNode("A",{c1="Hub"})
+bus.nodes["Hub"]=makeNode("Hub",{c1="A",c2="B"})
+bus.nodes["B"]=makeNode("B",{c1="Hub"})
+for _,nd in pairs(bus.nodes) do nd:boot() end; bus:pump()
+-- everyone has learned a stale ghost row for "[OP]" (an old portal pc that no longer exists under that name)
+for _,nd in pairs(bus.nodes) do nd.graph["[OP]"]={"Hub"}; nd.gen["[OP]"]=NOW-50; nd:saveGraph() end
+local function hasNode(nd,nm) return nd.graph[nm]~=nil end
+ok(hasNode(bus.nodes["A"],"[OP]") and hasNode(bus.nodes["B"],"[OP]"), "every node has the stale ghost [OP] in its map")
+-- run `forget [OP]` on ONE node; the removal gossips
+NOW=NOW+1; bus.nodes["A"]:removeNode("[OP]"); bus:pump()
+ok(not hasNode(bus.nodes["A"],"[OP]"), "the node that ran forget dropped [OP]")
+ok(not hasNode(bus.nodes["Hub"],"[OP]") and not hasNode(bus.nodes["B"],"[OP]"), "the tombstone gossiped: every loaded node dropped [OP]")
+-- the hard case: a node OFFLINE during the removal reloads with the ghost still on its own disk
+NOW=NOW+1
+bus.nodes["C"]=makeNode("C",{c1="Hub"})
+bus.nodes["C"].files.state={ graph={ C={"Hub"}, ["[OP]"]={"Hub"} }, gen={ C=NOW-100, ["[OP]"]=NOW-100 } }
+bus.nodes["C"]:boot(); bus:pump()
+ok(not hasNode(bus.nodes["C"],"[OP]"), "an offline node reloading with the ghost learns the tombstone and drops it (no resurrection)")
+ok(not hasNode(bus.nodes["A"],"[OP]"), "...and C re-gossiping its stale row did NOT bring [OP] back elsewhere")
+-- the tombstone is durable across a reload (kept on disk)
+NOW=NOW+1; bus.nodes["Hub"]:boot(); bus:pump()
+ok(bus.nodes["Hub"].tombs["[OP]"]~=nil and not hasNode(bus.nodes["Hub"],"[OP]"), "the tombstone persists across a reload")
+-- SAFETY: forgetting a node that is actually ALIVE - it un-tombstones itself with a fresher row
+NOW=NOW+1; bus.nodes["A"]:removeNode("B"); bus:pump()
+ok(not hasNode(bus.nodes["Hub"],"B"), "removing a still-alive node B momentarily drops it")
+NOW=NOW+1; bus.nodes["B"]:broadcastState(); bus:pump()
+ok(hasNode(bus.nodes["Hub"],"B") and bus.nodes["Hub"].tombs["B"]==nil, "live node B re-gossips a fresher row -> un-tombstoned everywhere (forget can't kill a live node)")
 
 print(("\n==== %d passed, %d failed ===="):format(pass, fail))
 if fail>0 then os.exit(1) end

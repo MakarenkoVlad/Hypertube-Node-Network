@@ -131,7 +131,7 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 
 | Type | Sent by | Meaning |
 |---|---|---|
-| `STATE{ nodes, trip, dests }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }`, the single `trip` (`{id,from,to,path,rider,ts,done}` or nil), AND `dests` (`name -> { to, ts }`, each rider's remembered destination). Receiver merges the map (fresher ts wins), the trip (`adoptTrip`: (ts,id) order, `done` monotonic), and dests (`mergeDest`: newer ts wins; `to=nil` is an arrival tombstone). |
+| `STATE{ nodes, trip, dests, tombs }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }`, the single `trip` (`{id,from,to,path,rider,ts,done}` or nil), `dests` (`name -> { to, ts }`, each rider's remembered destination), AND `tombs` (`name -> removalTs`, node-removal tombstones). Receiver merges the map (fresher ts wins), the trip (`adoptTrip`: (ts,id) order, `done` monotonic), dests (`mergeDest`: newer ts wins; `to=nil` is an arrival tombstone), and tombs (`mergeTomb`: newer removalTs wins, never self). A tomb suppresses any row for that name with `ts <= removalTs`; a row with `ts > removalTs` un-removes the node. |
 | `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
 | `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push` | OTA firmware push; `ht_boot` swaps `/firmware.lua` and reboots. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / every node's `log` | version ping / live log line. |
@@ -143,6 +143,14 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 > **Portal mouths consume `STATE` but add nothing to the map.** A mouth (`MODE == "mouth"`) sends `STATE`
 > with **no row of its own** (`nodes` never contains its name) — it only relays others' rows + the trip and
 > acts on the trip locally. So it stays invisible to routing and the menu. Don't make a mouth advertise itself.
+
+> **Removing a node needs a TOMBSTONE, not just a delete.** The map deliberately never drops a quiet node
+> (quiet usually = chunk unloaded), so a one-shot "delete" is undone the moment an offline node reloads and
+> re-gossips its row. `firmware.lua forget <name>` writes a durable, gossiped+persisted `tombs[name]=now()`
+> (carried in `STATE.tombs`) that suppresses any older row for that name network-wide and survives reloads
+> (Phase 25). It self-heals: a node that's actually alive re-gossips a row with `ts > removalTs` and
+> un-tombstones itself, so `forget` can't permanently kill a live node. `firmware.lua forget` with NO name keeps
+> its old meaning (drop this node's learned map and re-learn). Tombs prune after `TOMB_TTL` (30 days).
 
 > **OTA keeps config because config is a separate file.** In this unified model `/ht_node.cfg` is
 > independent of `/firmware.lua`, so an update is a whole-file replace — there are no in-firmware
@@ -198,7 +206,7 @@ push.sh                   git add/commit/push helper; prints the node update com
 
 ```bash
 luacheck src/                 # static analysis; if missing: brew install luacheck
-lua test/htsim.lua            # MUST print "125 passed, 0 failed" (or update the count with intent)
+lua test/htsim.lua            # MUST print "133 passed, 0 failed" (or update the count with intent)
 ```
 
 A no-luacheck fallback full-parse: `lua -e "assert(loadfile('src/ht_node.lua'))"`. The firmware can't

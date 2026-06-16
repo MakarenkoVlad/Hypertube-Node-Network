@@ -35,7 +35,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v32"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v33"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -338,7 +338,26 @@ if args[1] == "reset" then        -- wipe name + calibration + learned map + tun
   print("Config + tuning cleared - rebooting into fresh setup...")
   sleep(1); os.reboot()
 end
-if args[1] == "forget" then       -- drop only the learned map (re-learn topology); keep name + links
+if args[1] == "forget" then       -- no arg: drop our learned map (re-learn). With a name: REMOVE that node network-wide.
+  if args[2] then
+    -- NETWORK REMOVAL: write a durable tombstone for the named node into our shared-state file, then reboot so the
+    -- running firmware gossips the removal until every node (even ones that load later) drops its stale row. Run
+    -- once from ANY node. Everything after `forget` is the name, so spaces/brackets work quoted or not.
+    local nm = table.concat(args, " ", 2)
+    local d = {}
+    if fs.exists(GRAPHFILE) then
+      local rf = fs.open(GRAPHFILE, "r"); local t = textutils.unserialize(rf.readAll() or ""); rf.close()
+      if type(t) == "table" then d = t end
+    end
+    if type(d.graph) ~= "table" then d.graph = {} end
+    if type(d.gen)   ~= "table" then d.gen   = {} end
+    if type(d.tombs) ~= "table" then d.tombs = {} end
+    d.tombs[nm] = now(); d.graph[nm] = nil; d.gen[nm] = nil   -- mark removed as of now + drop the row immediately
+    local wf = fs.open(GRAPHFILE, "w"); if wf then wf.write(textutils.serialize(d)); wf.close() end
+    print("Removing '" .. nm .. "' from the network map.")
+    print("Gossiping the removal to every node (durable, survives reload). Rebooting...")
+    sleep(1); os.reboot()
+  end
   if fs.exists(GRAPHFILE) then fs.delete(GRAPHFILE) end
   print("Map cleared - rebooting..."); sleep(1); os.reboot()
 end
@@ -531,6 +550,27 @@ local function mergeDest(name, d)             -- merge one gossiped rider->dest;
   return false
 end
 
+-- TOMBSTONES: durable "this node is REMOVED as of ts T" markers (gossiped + persisted like the map). The map
+-- never drops a quiet node (quiet usually = chunk unloaded, not removed), so deleting a node needs an explicit
+-- tombstone that propagates and persists - otherwise an offline node reloads and re-gossips its stale row.
+-- A tomb suppresses any row for that name with ts <= T network-wide; if the node is actually still alive it
+-- re-gossips a row with ts > T and UN-tombstones itself (so `forget` can't permanently kill a live node). Tombs
+-- age out after TOMB_TTL (long, so even a long-unloaded node hears the removal before the tomb expires).
+local TOMB_TTL = 2592000                      -- s (30 days) a removal marker lives before it's pruned
+local tombs = {}                              -- name -> removal epoch ms
+local function pruneTombs() local t = now(); for nm, ts in pairs(tombs) do if t - (tonumber(ts) or 0) > TOMB_TTL * 1000 then tombs[nm] = nil end end end
+local function applyTombs()                   -- drop any local row a tombstone covers (its row is older than the removal)
+  for nm, ts in pairs(tombs) do
+    if nm ~= NAME and gen[nm] and gen[nm] <= ts then graph[nm] = nil; gen[nm] = nil end  -- never remove our OWN row
+  end
+end
+local function mergeTomb(name, ts)            -- merge one gossiped removal; newer ts wins. true if our tombs changed
+  ts = tonumber(ts) or 0
+  if type(name) ~= "string" or name == NAME or ts == 0 then return false end  -- never tombstone ourselves
+  if not tombs[name] or ts > tombs[name] then tombs[name] = ts; return true end
+  return false
+end
+
 local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComputerLabel(NAME) end end
 
 -- Durable topology. Persist the whole map so this node can route even when other
@@ -540,7 +580,7 @@ local function setNameLabel() if os.getComputerLabel() ~= NAME then os.setComput
 local function saveGraph()                    -- persist the whole shared state: map + the in-flight trip + rider dests
   pcall(function()
     local f = fs.open(GRAPHFILE, "w")
-    if f then f.write(textutils.serialize({ graph = graph, gen = gen, trip = trip, dests = riderDest })); f.close() end
+    if f then f.write(textutils.serialize({ graph = graph, gen = gen, trip = trip, dests = riderDest, tombs = tombs })); f.close() end
   end)
 end
 local function loadGraph()
@@ -561,6 +601,10 @@ local function loadGraph()
       for nm, dd in pairs(d.dests) do if type(dd) == "table" then riderDest[nm] = dd end end
       pruneDests()
     end
+    if type(d) == "table" and type(d.tombs) == "table" then   -- recover removal markers, then drop any rows they cover
+      for nm, ts in pairs(d.tombs) do if type(ts) == "number" then tombs[nm] = ts end end
+      pruneTombs(); applyTombs()
+    end
   end)
 end
 loadGraph()   -- begin from the last-known topology AND trip, so we route (and resume) before anyone announces
@@ -568,25 +612,34 @@ loadGraph()   -- begin from the last-known topology AND trip, so we route (and r
 -- refresh our own row, then gossip the ENTIRE known map AND the current trip (the whole shared state)
 local function broadcastState()
   if MODE ~= "mouth" then graph[NAME] = myNeighbours(); gen[NAME] = now() end  -- a mouth never advertises itself as a node
+  pruneTombs(); applyTombs()
   saveGraph()
   local nodes = {}
   for n, nbrs in pairs(graph) do nodes[n] = { nbrs = nbrs, ts = gen[n] or 0 } end
   pruneDests()
-  bcast({ type = "STATE", nodes = nodes, trip = trip, dests = riderDest })
+  bcast({ type = "STATE", nodes = nodes, trip = trip, dests = riderDest, tombs = tombs })
 end
 
--- merge a gossiped map + trip + rider dests. Returns (mapChanged, tripChanged); per node keep the newer
--- timestamp, adoptTrip merges the shared trip, and mergeDest merges each remembered rider->destination.
-local function mergeState(nodes, gtrip, gdests)
+-- merge a gossiped map + trip + rider dests + removal tombstones. Returns (mapChanged, tripChanged); per node
+-- keep the newer timestamp, adoptTrip merges the shared trip, mergeDest merges each rider->destination, and a
+-- tombstone suppresses a stale row for a removed node (a row newer than the tomb un-removes the node).
+local function mergeState(nodes, gtrip, gdests, gtombs)
   local mapChanged = false
+  if type(gtombs) == "table" then for nm, ts in pairs(gtombs) do if mergeTomb(nm, ts) then mapChanged = true end end end  -- learn removals FIRST
   if type(nodes) == "table" then
     for n, info in pairs(nodes) do
       if type(info) == "table" and type(info.nbrs) == "table" then
         local ts = tonumber(info.ts) or 0
-        if not gen[n] or ts > gen[n] then graph[n] = info.nbrs; gen[n] = ts; mapChanged = true end
+        if tombs[n] and ts <= tombs[n] then                 -- a row older than its removal: ignore it
+          -- skip (the node is tombstoned and this row predates the removal)
+        elseif not gen[n] or ts > gen[n] then
+          graph[n] = info.nbrs; gen[n] = ts; mapChanged = true
+          if tombs[n] then tombs[n] = nil end               -- a row newer than the tomb: the node is back -> un-remove it
+        end
       end
     end
   end
+  applyTombs()                                              -- drop any local row a (new or existing) tomb now covers
   local tripChanged = gtrip ~= nil and adoptTrip(gtrip)
   local destChanged = false
   if type(gdests) == "table" then for nm, dd in pairs(gdests) do if mergeDest(nm, dd) then destChanged = true end end end
@@ -915,7 +968,7 @@ end
 local function handle(msg)
   if type(msg) ~= "table" then return end
   if msg.type == "STATE" then
-    local mapChanged, tripChanged = mergeState(msg.nodes, msg.trip, msg.dests)
+    local mapChanged, tripChanged = mergeState(msg.nodes, msg.trip, msg.dests, msg.tombs)
     if tripChanged then
       reconcile()
       local t = live()
@@ -993,7 +1046,7 @@ local function runMouth()
       if e[4] == PROTO and type(e[3]) == "table" then
         local msg = e[3]
         if msg.type == "STATE" then
-          local _, tripChanged = mergeState(msg.nodes, msg.trip, msg.dests)
+          local _, tripChanged = mergeState(msg.nodes, msg.trip, msg.dests, msg.tombs)
           if tripChanged then mouthGate(); mouthDraw() end
         elseif msg.type == "LSREQ" then broadcastState() end
       elseif e[4] == LOGPROTO and type(e[3]) == "table" and e[3].ping then

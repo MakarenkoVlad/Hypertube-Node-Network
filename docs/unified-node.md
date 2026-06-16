@@ -212,6 +212,7 @@ and auto-update, until it's all-green. The version is also on each monitor's top
 | `firmware.lua monitor` | pick which screen is this node's menu when it has several monitors (pinned in config, survives OTA). |
 | `firmware.lua reset` | wipe config + learned map; reboot into fresh setup. |
 | `firmware.lua forget` | drop only the learned map (re-learn topology); keep name + tubes. |
+| `firmware.lua forget <name>` | remove a node from the whole network (durable gossiped tombstone); run once from any node. Self-heals if the node is actually alive. |
 | `firmware.lua log` | print this node's local event log. |
 | `firmware.lua report` | write a full diagnostic snapshot to `/ht_report.txt` (config, peripherals, map, log) — `pastebin put` it to share. |
 | `firmware.lua set <KEY> <n>` | tweak a tunable in-game (`/ht_tune.cfg`, survives OTA, reboots to apply). Keys: RPM, CALIBRATE_RPM, TRIP_TIMEOUT, TRIP_BEAT, RELAUNCH_HOLD, LS_INTERVAL, BOARD_RANGE, BOARD_HEIGHT. |
