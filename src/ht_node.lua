@@ -32,7 +32,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v27"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v28"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -648,25 +648,26 @@ local function reconcile()
 end
 
 -- ---- player presence -----------------------------------------------------
--- names of every player currently within the pad volume (cuboid if the detector
--- supports it, so vertical reach can be taller; else a plain sphere).
+-- Names of every player on/at the pad. We UNION two detector queries so a rider is never missed:
+--   * getPlayersInRange is a SPHERE centred on the detector - distance 0 is the detector's OWN block, which
+--     is exactly where a rider exiting a hypertube is physically placed (they land IN the detector block);
+--   * getPlayersInCubic adds taller vertical / box reach.
+-- A rider seen by EITHER counts, so one sitting inside the detector block is always detected.
 local function playersOnPad()
   if not detector then return {} end
-  local players
-  if detector.getPlayersInCubic then
-    local ok, p = pcall(detector.getPlayersInCubic, BOARD_RANGE, BOARD_HEIGHT, BOARD_RANGE)
-    if ok then players = p end
-  end
-  if not players then
-    local ok, p = pcall(detector.getPlayersInRange, math.max(BOARD_RANGE, BOARD_HEIGHT))
-    if ok then players = p end
-  end
-  local out = {}
-  if type(players) == "table" then
+  local seen, out = {}, {}
+  local function add(players)
+    if type(players) ~= "table" then return end
     for _, pl in ipairs(players) do
       local nm = (type(pl) == "table") and pl.name or pl     -- detector may return objects or names
-      if nm then out[#out + 1] = nm end
+      if nm and not seen[nm] then seen[nm] = true; out[#out + 1] = nm end
     end
+  end
+  if detector.getPlayersInRange then
+    local ok, p = pcall(detector.getPlayersInRange, math.max(BOARD_RANGE, BOARD_HEIGHT, 1)); if ok then add(p) end
+  end
+  if detector.getPlayersInCubic then
+    local ok, p = pcall(detector.getPlayersInCubic, BOARD_RANGE, BOARD_HEIGHT, BOARD_RANGE); if ok then add(p) end
   end
   return out
 end
