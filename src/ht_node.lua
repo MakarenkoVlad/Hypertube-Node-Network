@@ -25,6 +25,7 @@ local TRIP_TIMEOUT  = 30     -- seconds after a trip STARTS that it auto-clears 
 local TRIP_BEAT     = 2      -- s: re-broadcast the active trip so a node that just loaded catches it
 local RELAUNCH_HOLD = 3      -- s cooldown after a rider leaves our pad before we'd re-open the SAME trip's tube (anti-bounce)
 local LS_INTERVAL  = 5       -- seconds between link-state broadcasts (steady state)
+local POKE_INTERVAL = 8     -- s between idle monitor re-renders (un-stick a black/stale client frame)
 local GRAPHFILE    = "/ht_graph.dat"  -- durable copy of the network map (survives reboot / chunk unload)
 local PROTO        = "hypertube"
 local CFG          = "/ht_node.cfg"
@@ -32,7 +33,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v30"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v31"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -910,6 +911,7 @@ local padTimer  = os.startTimer(1)
 local beatTimer = os.startTimer(TRIP_BEAT)
 local warm      = 5                              -- quick extra roll-calls right after
 local warmTimer = os.startTimer(0.5)             -- boot so we converge in ~1-2s, not 15s
+local pokeTimer = os.startTimer(POKE_INTERVAL)   -- periodically un-stick a stale/black monitor frame
 refresh()
 
 while true do
@@ -947,6 +949,11 @@ while true do
     end
   elseif ev == "timer" then
     if e[2] == lsTimer then broadcastState(); lsTimer = os.startTimer(LS_INTERVAL)
+    elseif e[2] == pokeTimer then
+      -- self-heal a black/stale monitor (client render goes blank when you come into view). Only when the
+      -- pad is EMPTY, so it never flickers while you're standing there using it.
+      if mon and not (detector and onPad(nil)) then pokeMonitor(); refresh() end
+      pokeTimer = os.startTimer(POKE_INTERVAL)
     elseif e[2] == warmTimer then
       if warm > 0 then
         warm = warm - 1
