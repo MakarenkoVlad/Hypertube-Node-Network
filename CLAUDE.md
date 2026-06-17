@@ -111,9 +111,10 @@ which still exists for portals that drop you straight onto the far station's pad
   fine in one-shot CLI subcommands like `spin`, which exit before the loop starts.)
 - **`rednet.broadcast` throws if no modem is open.** Always go through the `bcast` helper (it
   `pcall`s and no-ops when no modem) so a modem-less node still boots, draws its screen, and runs.
-- **Gate abstraction:** a tube is opened with `setTargetSpeed(RPM)` and closed with `setTargetSpeed(0)`.
-  Entrances need **≥16 RPM** to open (so `CALIBRATE_RPM` is 20, above the threshold). Drive controllers
-  only through `gateToward`/`allStop`.
+- **Gate abstraction:** a tube is opened with `setTargetSpeed(RPM)` (or `MOUTH_RPM` on a mouth) and *closed*
+  with `setTargetSpeed(IDLE_RPM)` — a slow idle spin (default 5), **not** a full stop. Entrances need **≥16 RPM**
+  to pull a player in (so `CALIBRATE_RPM` is 20, above the threshold), and `IDLE_RPM` is capped at 15 so a closed
+  tube keeps its shaft turning but can **never** grab a rider. Drive controllers only through `gateToward`/`allStop`.
 - **Setup must own the keyboard.** `runSetup` runs **before** the main loop / OTA listener starts
   (see `ht_boot.lua`), blanks the monitor, and drains queued input — otherwise the live menu loop
   steals keystrokes (this was a real, repeatedly-hit bug). Don't reintroduce a concurrent loop during setup.

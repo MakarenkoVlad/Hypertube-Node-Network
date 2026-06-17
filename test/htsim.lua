@@ -6,7 +6,7 @@
 -- `done` flag and a TRIP_TIMEOUT expiry) - a reloaded node recovers it from its
 -- own disk or any peer's gossip. RPM/timeouts match the firmware.
 -- ===========================================================================
-local RPM = 128              -- matches the firmware station tube drive speed (open=RPM, closed=0)
+local RPM = 64               -- matches the firmware station tube drive speed (open=RPM, closed=0)
 local MOUTH_RPM = 32         -- matches the firmware portal-mouth drive speed (4x slower so riders exit the portal gently)
 local TRIP_TIMEOUT = 30
 local RELAUNCH_HOLD = 3        -- matches the firmware tunable (launch cooldown)
@@ -120,6 +120,8 @@ local function makeNode(name, links, portals, bridge)
         q[#q+1]=nb end end end
   end
   function nd:controllerToward(nb) for c,d in pairs(self.LINKS) do if d==nb then return c end end end
+  -- closed value is 0 here as the LOGIC sentinel; the firmware idles a closed tube at IDLE_RPM (a slow spin
+  -- below the 16 RPM pull threshold) - a physical detail that doesn't change WHICH tube is open vs closed.
   function nd:gateToward(nb) for c,d in pairs(self.LINKS) do self.gates[c]=(nb~=nil and d==nb) and (self.bridge and MOUTH_RPM or RPM) or 0 end end
   function nd:allStop() self:gateToward(nil) end
   function nd:indexIn(p) for i,n in ipairs(p) do if n==self.NAME then return i end end end
