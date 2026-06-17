@@ -160,13 +160,14 @@ For a whole-network trace, run `htlog` while reproducing the issue (it tees ever
 and applied on reboot:
 
 ```
-firmware.lua set RPM 192           # launch speed
+firmware.lua set RPM 192           # normal tube speed
+firmware.lua set MOUTH_RPM 24      # portal-mouth exit speed (run ON a mouth; lower = gentler portal exit)
 firmware.lua set CALIBRATE_RPM 24  # spin speed during `spin`
 firmware.lua set BOARD_RANGE 3     # pad detection radius
 ```
 
-Tunable keys: `RPM`, `CALIBRATE_RPM`, `TRIP_TIMEOUT`, `TRIP_BEAT`, `RELAUNCH_HOLD`, `LS_INTERVAL`,
-`BOARD_RANGE`, `BOARD_HEIGHT`. Current values show in `firmware.lua report`.
+Tunable keys: `RPM`, `MOUTH_RPM`, `CALIBRATE_RPM`, `TRIP_TIMEOUT`, `TRIP_BEAT`, `RELAUNCH_HOLD`, `LS_INTERVAL`,
+`BOARD_RANGE`, `BOARD_HEIGHT`. Current values show in `firmware.lua report`. (`MOUTH_RPM` only affects portal mouths.)
 
 ## Develop with Claude Code
 

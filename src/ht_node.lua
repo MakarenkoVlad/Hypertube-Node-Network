@@ -21,7 +21,8 @@
   and never touch that file. Re-run setup any time with:  firmware.lua setup
 --]]
 
-local RPM           = 128
+local RPM           = 128    -- normal tube drive speed
+local MOUTH_RPM     = 32      -- portal MOUTH drive speed: 4x slower than RPM, so a rider exits the portal gently instead of being flung through the wall (still above the 16 RPM open threshold)
 local CALIBRATE_RPM = 20     -- `firmware.lua spin <n>` ID speed (entrances need >=16 RPM to open)
 local TRIP_TIMEOUT  = 30     -- seconds after a trip STARTS that it auto-clears (anchored to trip.ts)
 local TRIP_BEAT     = 2      -- s: re-broadcast the active trip so a node that just loaded catches it
@@ -37,7 +38,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v34"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v35"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -45,12 +46,12 @@ local REPORTFILE = "/ht_report.txt"
 
 -- Tunables you can adjust in-game without editing/redeploying code. `firmware.lua set
 -- <KEY> <number>` writes /ht_tune.cfg; loaded here at boot so it survives firmware updates.
-local TUNABLES = { "RPM", "CALIBRATE_RPM", "TRIP_TIMEOUT", "TRIP_BEAT", "RELAUNCH_HOLD", "LS_INTERVAL", "BOARD_RANGE", "BOARD_HEIGHT" }
+local TUNABLES = { "RPM", "MOUTH_RPM", "CALIBRATE_RPM", "TRIP_TIMEOUT", "TRIP_BEAT", "RELAUNCH_HOLD", "LS_INTERVAL", "BOARD_RANGE", "BOARD_HEIGHT" }
 -- Safe ranges. Out-of-range values are REJECTED by `set` and CLAMPED at boot, so neither a typo
 -- nor a hand-edited /ht_tune.cfg can wedge a node (RPM<16 never opens a tube, TRIP_TIMEOUT=0 cancels
 -- every trip, LS_INTERVAL/TRIP_BEAT=0 saturate the event loop, etc.).
-local TUNE_MIN = { RPM = 16, CALIBRATE_RPM = 1,   TRIP_TIMEOUT = 5,   TRIP_BEAT = 1,  RELAUNCH_HOLD = 1,  LS_INTERVAL = 1,   BOARD_RANGE = 1,  BOARD_HEIGHT = 1 }
-local TUNE_MAX = { RPM = 256, CALIBRATE_RPM = 256, TRIP_TIMEOUT = 600, TRIP_BEAT = 60, RELAUNCH_HOLD = 60, LS_INTERVAL = 300, BOARD_RANGE = 32, BOARD_HEIGHT = 64 }
+local TUNE_MIN = { RPM = 16, MOUTH_RPM = 16, CALIBRATE_RPM = 1,   TRIP_TIMEOUT = 5,   TRIP_BEAT = 1,  RELAUNCH_HOLD = 1,  LS_INTERVAL = 1,   BOARD_RANGE = 1,  BOARD_HEIGHT = 1 }
+local TUNE_MAX = { RPM = 256, MOUTH_RPM = 256, CALIBRATE_RPM = 256, TRIP_TIMEOUT = 600, TRIP_BEAT = 60, RELAUNCH_HOLD = 60, LS_INTERVAL = 300, BOARD_RANGE = 32, BOARD_HEIGHT = 64 }
 local function clampTune(key, v)              -- numeric + clamped to the key's safe range, else nil
   v = tonumber(v)
   if not v or not TUNE_MIN[key] then return nil end
@@ -63,6 +64,7 @@ do
     if f then local t = textutils.unserialize(f.readAll() or ""); f.close(); if type(t) == "table" then tune = t end end
   end
   RPM           = clampTune("RPM", tune.RPM)                     or RPM
+  MOUTH_RPM     = clampTune("MOUTH_RPM", tune.MOUTH_RPM)         or MOUTH_RPM
   CALIBRATE_RPM = clampTune("CALIBRATE_RPM", tune.CALIBRATE_RPM) or CALIBRATE_RPM
   TRIP_TIMEOUT  = clampTune("TRIP_TIMEOUT", tune.TRIP_TIMEOUT)   or TRIP_TIMEOUT
   TRIP_BEAT     = clampTune("TRIP_BEAT", tune.TRIP_BEAT)         or TRIP_BEAT
@@ -417,7 +419,7 @@ if args[1] == "report" then       -- write a full diagnostic snapshot to a file 
   add("portals (walk-through): " .. ((cfg and cfg.portals and #cfg.portals > 0) and table.concat(cfg.portals, ", ") or "(none)"))
   add("")
   add("[tuning]  (current effective values)")
-  add(("  RPM=%s CALIBRATE_RPM=%s TRIP_TIMEOUT=%s TRIP_BEAT=%s"):format(RPM, CALIBRATE_RPM, TRIP_TIMEOUT, TRIP_BEAT))
+  add(("  RPM=%s MOUTH_RPM=%s CALIBRATE_RPM=%s TRIP_TIMEOUT=%s TRIP_BEAT=%s"):format(RPM, MOUTH_RPM, CALIBRATE_RPM, TRIP_TIMEOUT, TRIP_BEAT))
   add(("  RELAUNCH_HOLD=%s LS_INTERVAL=%s BOARD_RANGE=%s BOARD_HEIGHT=%s"):format(RELAUNCH_HOLD, LS_INTERVAL, BOARD_RANGE, BOARD_HEIGHT))
   local ov = {}; for k, v in pairs(tune) do ov[#ov + 1] = k .. "=" .. tostring(v) end
   add("  overrides (" .. TUNEFILE .. "): " .. (#ov > 0 and table.concat(ov, " ") or "none"))
@@ -762,7 +764,7 @@ end
 local function gateToward(nb)                  -- spin only the owned tube to nb (nil = stop owned)
   for _, c in ipairs(ctrls) do
     if LINKS[c.name] then                      -- skip controllers we don't own
-      pcall(c.wrap.setTargetSpeed, (nb ~= nil and LINKS[c.name] == nb) and RPM or 0)
+      pcall(c.wrap.setTargetSpeed, (nb ~= nil and LINKS[c.name] == nb) and (MODE == "mouth" and MOUTH_RPM or RPM) or 0)
     end
   end
 end

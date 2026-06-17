@@ -89,7 +89,10 @@ spins its tube toward `near` **in advance** iff the live trip's `path` contains 
 **consecutive** entries — i.e. a rider is crossing this portal in this mouth's direction — and keeps it shut
 otherwise, so a rider crossing the **other** way isn't re-grabbed. It reuses the same trip machinery
 (`adoptTrip`/`live`/`mergeState`/`saveGraph`/`loadGraph`/`gateToward`), so a mouth that reloads mid-crossing
-recovers the live trip from its own disk (Phase 24). Station logic is untouched — mouths are purely additive.
+recovers the live trip from its own disk (Phase 24). A mouth drives its tube at **`MOUTH_RPM`** (default 32,
+~4× slower than `RPM`) — `gateToward` uses `MOUTH_RPM` when `MODE == "mouth"` — so a rider is set down gently on
+the far side instead of overshooting the wall; it's a tunable (`firmware.lua set MOUTH_RPM <n>`). Station logic
+is untouched — mouths are purely additive.
 Distinct from the older walk-through `portals` field (a tubeless "walk through to X" neighbour, Phase 11),
 which still exists for portals that drop you straight onto the far station's pad.
 

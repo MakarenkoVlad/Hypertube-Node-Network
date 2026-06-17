@@ -6,7 +6,8 @@
 -- `done` flag and a TRIP_TIMEOUT expiry) - a reloaded node recovers it from its
 -- own disk or any peer's gossip. RPM/timeouts match the firmware.
 -- ===========================================================================
-local RPM = 128
+local RPM = 128              -- matches the firmware station tube drive speed (open=RPM, closed=0)
+local MOUTH_RPM = 32         -- matches the firmware portal-mouth drive speed (4x slower so riders exit the portal gently)
 local TRIP_TIMEOUT = 30
 local RELAUNCH_HOLD = 3        -- matches the firmware tunable (launch cooldown)
 local DEST_TTL = 300          -- matches the firmware: how long a remembered rider->dest lives
@@ -119,7 +120,7 @@ local function makeNode(name, links, portals, bridge)
         q[#q+1]=nb end end end
   end
   function nd:controllerToward(nb) for c,d in pairs(self.LINKS) do if d==nb then return c end end end
-  function nd:gateToward(nb) for c,d in pairs(self.LINKS) do self.gates[c]=(nb~=nil and d==nb) and RPM or 0 end end
+  function nd:gateToward(nb) for c,d in pairs(self.LINKS) do self.gates[c]=(nb~=nil and d==nb) and (self.bridge and MOUTH_RPM or RPM) or 0 end end
   function nd:allStop() self:gateToward(nil) end
   function nd:indexIn(p) for i,n in ipairs(p) do if n==self.NAME then return i end end end
   function nd:tripHint(t)   -- screen hint only (gates are detector-driven, never opened here)
@@ -643,7 +644,7 @@ ok(not listed(bus.nodes["A"],"Bm") and not listed(bus.nodes["A"],"Cm"), "neither
 -- OUTBOUND A->D: the nether mouth (Cm) spins toward D in advance; the overworld mouth (Bm) stays shut
 bus.nodes["A"]:startTrip("D","Wade"); bus:pump()
 ok(bus.nodes["A"].gates.c1==RPM, "A (origin) flings the rider toward D / the portal")
-ok(bus.nodes["Cm"].gates.m1==RPM, "nether mouth opens its D tube IN ADVANCE (rider crossing A->D)")
+ok(bus.nodes["Cm"].gates.m1==MOUTH_RPM, "nether mouth opens its D tube IN ADVANCE (rider crossing A->D)")
 ok((bus.nodes["Bm"].gates.m1 or 0)==0, "overworld mouth stays SHUT outbound (won't re-grab the rider back toward A)")
 ok(bus.nodes["D"]:landPad("Wade")==true, "rider lands on D -> arrival confirmed")
 bus:pump()
@@ -652,7 +653,7 @@ ok((bus.nodes["Cm"].gates.m1 or 0)==0, "nether mouth closed once the trip finish
 -- RETURN D->A: mirror image - overworld mouth spins toward A, nether mouth stays shut
 NOW=NOW+10
 bus.nodes["D"]:startTrip("A","Wade"); bus:pump()
-ok(bus.nodes["Bm"].gates.m1==RPM, "overworld mouth opens its A tube IN ADVANCE (rider crossing D->A)")
+ok(bus.nodes["Bm"].gates.m1==MOUTH_RPM, "overworld mouth opens its A tube IN ADVANCE (rider crossing D->A)")
 ok((bus.nodes["Cm"].gates.m1 or 0)==0, "nether mouth stays SHUT on the return (no re-grab toward D)")
 ok(bus.nodes["A"]:landPad("Wade")==true, "rider lands back on A -> arrival confirmed")
 bus:pump(); ok(not anyActive(), "return trip cleared")
@@ -660,18 +661,18 @@ bus:pump(); ok(not anyActive(), "return trip cleared")
 NOW=NOW+10
 ok(bus.nodes["A"]:pathTo("Z") and table.concat(bus.nodes["A"]:pathTo("Z"),">")=="A>D>Z", "A->Z routes A>D>Z across the portal")
 bus.nodes["A"]:startTrip("Z","Mae"); bus:pump()
-ok(bus.nodes["Cm"].gates.m1==RPM, "nether mouth flings across the portal toward D on the multi-hop trip")
+ok(bus.nodes["Cm"].gates.m1==MOUTH_RPM, "nether mouth flings across the portal toward D on the multi-hop trip")
 ok(bus.nodes["D"].gates.c2==RPM and (bus.nodes["D"].gates.c1 or 0)==0, "D (junction) opens onward to Z, not back to A")
 ok(bus.nodes["Z"]:landPad("Mae")==true, "rider delivered to Z through portal + junction")
 bus:pump(); ok(not anyActive(), "multi-hop portal trip cleared end-to-end")
 -- a MOUTH that reloads mid-crossing recovers the live trip from its OWN disk and re-opens (reboot-survivable)
 NOW=NOW+10
 bus.nodes["A"]:startTrip("D","Rin"); bus:pump()
-ok(bus.nodes["Cm"].gates.m1==RPM, "nether mouth open for a fresh outbound crossing")
+ok(bus.nodes["Cm"].gates.m1==MOUTH_RPM, "nether mouth open for a fresh outbound crossing")
 for _,nd in pairs(bus.nodes) do nd:unload() end                      -- the mouth cycles its chunk while everyone else is off too
 NOW=NOW+2; bus.nodes["Cm"]:boot(); bus:pump()                        -- reloads ALONE: no peer answers
 ok(bus.nodes["Cm"]:live()~=nil, "reloaded mouth recovered the live crossing from its OWN disk (no peer)")
-ok(bus.nodes["Cm"].gates.m1==RPM, "...and re-opened its tube so the crossing rider isn't stranded")
+ok(bus.nodes["Cm"].gates.m1==MOUTH_RPM, "...and re-opened its tube so the crossing rider isn't stranded")
 
 print("== Phase 25: a TOMBSTONE removes a renamed/dead node network-wide and survives reload (programmatic cleanup) ==")
 NOW=220000
