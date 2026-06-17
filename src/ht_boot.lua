@@ -31,7 +31,7 @@
     /ht_pin        (optional) if present, this node skips GitHub auto-update
 --]]
 
-local BVERSION = "b2"   -- bootstrap version; bump when ht_boot.lua changes so it self-updates like firmware
+local BVERSION = "b3"   -- bootstrap version; bump when ht_boot.lua changes so it self-updates like firmware
 local PROTO = "ht_ota"
 local FW    = "/firmware.lua"
 local BASE  = "https://raw.githubusercontent.com/MakarenkoVlad/Hypertube-Node-Network/main/"
@@ -137,9 +137,19 @@ local function otaListener()
     if type(msg) == "table" and msg.type == "HT_UPDATE" and type(msg.code) == "string" then
       local g = msg.group or "all"
       if g == "all" or g == GROUP then
-        print("[OTA] update received (group " .. g .. ") - config in /ht_node.cfg is kept.")
-        if writeAll(FW, msg.code) and readAll(FW) == msg.code then   -- crash-safe + verify the write landed
-          print("[OTA] rebooting into new firmware...")
+        -- VALIDATE before applying, same guards as the GitHub path: a pushed firmware must be COMPLETE (marker +
+        -- end-of-file sentinel in the tail), COMPILE, and be STRICTLY NEWER than what's on disk. Without this, ANY
+        -- push - a redundant/equal ht_push, an older build, or garbage - would write+reboot every loaded node, and
+        -- each spurious reboot re-opens junction gates from the restored trip with NO rider present ("tubes open in
+        -- random places"). Forward-only here mirrors the firmware's peer auto-propagation; a no-op push is silent.
+        local code = msg.code
+        local complete = code:find("HT Node", 1, true) and code:sub(-256):find(SENTINEL, 1, true) and load(code)
+        if not complete then
+          print("[OTA] ignored - incomplete/invalid firmware (no reboot).")
+        elseif versionOf(code) <= versionOf(readAll(FW)) then
+          print("[OTA] ignored - not newer than current firmware (no reboot).")
+        elseif writeAll(FW, code) and readAll(FW) == code then   -- crash-safe + verify the write landed
+          print("[OTA] firmware updated (group " .. g .. ") - config kept - rebooting...")
           sleep(0.5); os.reboot()
         else
           print("[OTA] write failed - keeping current firmware.")

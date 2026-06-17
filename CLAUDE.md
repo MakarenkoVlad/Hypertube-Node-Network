@@ -115,6 +115,9 @@ which still exists for portals that drop you straight onto the far station's pad
   with `setTargetSpeed(IDLE_RPM)` — a slow idle spin (default 5), **not** a full stop. Entrances need **≥16 RPM**
   to pull a player in (so `CALIBRATE_RPM` is 20, above the threshold), and `IDLE_RPM` is capped at 15 so a closed
   tube keeps its shaft turning but can **never** grab a rider. Drive controllers only through `gateToward`/`allStop`.
+  On boot the node sweeps **every discovered controller** (not just `LINKS` members) to `IDLE_RPM` once, so a
+  controller left at a transport speed — a tube skipped in setup, or one latched at `CALIBRATE_RPM` by an
+  interrupted `spin` — can't sit open as a live entrance (`gateToward` only ever touches `LINKS` members).
 - **Setup must own the keyboard.** `runSetup` runs **before** the main loop / OTA listener starts
   (see `ht_boot.lua`), blanks the monitor, and drains queued input — otherwise the live menu loop
   steals keystrokes (this was a real, repeatedly-hit bug). Don't reintroduce a concurrent loop during setup.
@@ -137,7 +140,7 @@ handlers in sync — a message no one handles, or a handler for a shape no one s
 |---|---|---|
 | `STATE{ nodes, trip, dests, tombs, ver }` | `broadcastState` (boot, heartbeat, beat, on `LSREQ`) | the WHOLE shared state: the map `nodes[name]={ nbrs, ts }`, the single `trip` (`{id,from,to,path,rider,ts,done}` or nil), `dests` (`name -> { to, ts }`, each rider's remembered destination), `tombs` (`name -> removalTs`, node-removal tombstones), AND `ver` (this node's firmware version, for peer auto-propagation). Receiver merges the map (fresher ts wins), the trip (`adoptTrip`: (ts,id) order, `done` monotonic), dests (`mergeDest`: newer ts wins; `to=nil` is an arrival tombstone), and tombs (`mergeTomb`: newer removalTs wins, never self). A tomb suppresses any row for that name with `ts <= removalTs`; a row with `ts > removalTs` un-removes the node. |
 | `LSREQ{}` | boot, warm-up | "send me your shared state" — each node replies with `STATE` (map + trip). |
-| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push`; **any node, to an OLDER peer** (auto-propagation) | OTA firmware push; `ht_boot` swaps `/firmware.lua` and reboots. A running node sends its own firmware to peers advertising a lower `ver` (forward-only), so one seed spreads network-wide. |
+| `HT_UPDATE{ code,group }` (`ht_ota`) | `ht_push`; **any node, to an OLDER peer** (auto-propagation) | OTA firmware push. `ht_boot`'s receiver **validates before applying** — marker + `@HT-NODE-EOF` sentinel-in-tail + compiles + **strictly newer than the on-disk version** — then swaps `/firmware.lua` and reboots; an equal/older/garbage push is a silent no-op (NOT a reboot). A running node sends its own firmware to peers advertising a lower `ver` (forward-only), so one seed spreads network-wide. |
 | `{ ping }` / `{ node,ver,msg }` (`ht_log`) | `htlog` / every node's `log` | version ping / live log line. |
 
 > **The trip is shared state, not a message.** `startTrip` and arrival are just writes to `trip` that

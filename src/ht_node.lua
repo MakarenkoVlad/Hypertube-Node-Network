@@ -39,7 +39,7 @@ local BOARD_RANGE  = 2       -- pad detection: horizontal reach (blocks)
 local BOARD_HEIGHT = 3       -- pad detection: vertical reach (blocks) - taller so a rider who lands
                              -- a block high/low is still seen (needs detector's getPlayersInCubic)
 local args = { ... }
-local VERSION  = "v37"       -- bump on every change; shown on the monitor + printed/logged on boot
+local VERSION  = "v38"       -- bump on every change; shown on the monitor + printed/logged on boot
 local LOGPROTO = "ht_log"    -- live network log channel (the htlog viewer listens here)
 local LOGFILE  = "/ht.log"   -- rolling local log on each node (view with: firmware.lua log)
 local TUNEFILE = "/ht_tune.cfg"   -- per-node tuning overrides (survives OTA; set via: firmware.lua set)
@@ -992,12 +992,12 @@ local function arrive(reason)
   if reason then log(reason) end
 end
 
-local function startTrip(dest)
+local function startTrip(dest, rider)
   if dest == NAME then return end
   if live() and (now() - (trip.ts or 0)) < 1500 then return end   -- debounce double-taps; re-tap still re-routes
   local path = pathTo(dest)
   if not path then draw("No route to " .. dest, colors.red); return end
-  local rider = riderOnPad()
+  rider = rider or riderOnPad()                 -- caller may name the rider (auto-reboard); else it's whoever tapped/stands here
   if not rider then draw("Step onto the pad first", colors.orange); return end  -- a trip MUST name its rider
                                                                                 -- (so a bystander can't gate/complete it)
   local ts = math.max(now(), (trip and tonumber(trip.ts) or 0) + 1)   -- strictly newer so adoptTrip can't reject ours
@@ -1071,7 +1071,9 @@ local function mouthDraw()
   end)
 end
 local function runMouth()
-  setNameLabel(); allStop()
+  setNameLabel()
+  for _, c in ipairs(ctrls) do pcall(c.wrap.setTargetSpeed, IDLE_RPM) end  -- neutralize every discovered tube to a safe idle (incl. one left latched by an interrupted spin)
+  allStop()
   loadGraph()                                   -- recover the in-flight trip from our OWN disk (reboot-survivable)
   log(("boot MOUTH %s | %s<->%s flings->%s tubes=%d modem=%s"):format(VERSION, tostring(BRIDGE.a), tostring(BRIDGE.d), tostring(BRIDGE.near), #ctrls, tostring(netUp)))
   if #ctrls == 0 then log("WARNING: portal mouth has no controller - no tube to spin!") end
@@ -1128,6 +1130,7 @@ if MODE == "mouth" then runMouth() end   -- a portal mouth runs its own loop and
 -- `done` reaches us. Gates are detector-gated, so a restored trip opens NO tube until its rider is actually
 -- on our pad - a trip that finished while we were unloaded can never re-open a gate (no suck-back).
 setNameLabel()
+for _, c in ipairs(ctrls) do pcall(c.wrap.setTargetSpeed, IDLE_RPM) end  -- neutralize EVERY discovered tube to a safe idle: catches an unowned/skipped controller, or one left at CALIBRATE_RPM by an interrupted `spin`, that gateToward (LINKS-only) would never touch
 allStop()
 log(("boot firmware %s | tubes=%d detector=%s modem=%s monitor=%s"):format(VERSION, #ctrls, tostring(detector ~= nil), tostring(netUp), tostring(monName or false)))
 if #monAll > 1 then log(("note: %d monitors - drawing to %s (pin with: firmware.lua monitor)"):format(#monAll, tostring(monName))) end
@@ -1213,7 +1216,7 @@ while true do
           local d = riderDest[who]                                      -- 2) AUTO-REBOARD: if we remember where they're
           if d and d.to and d.to ~= NAME and not live() and pathTo(d.to) then  --    headed, re-launch them from HERE
             log("auto-reboard " .. who .. " -> " .. d.to .. " (no live trip; using remembered destination)")
-            startTrip(d.to)                                             --    ourselves - no peer needed at this moment
+            startTrip(d.to, who)                                        --    ourselves (for THIS player) - no peer needed
           end
         end
       elseif i == #t.path then                                          -- DESTINATION: confirm when OUR rider lands
